@@ -132,6 +132,7 @@ def liftover_peaks(
     try:
         # Check if input file exists
         if not os.path.exists(input_bed):
+            print(f"❌ ERROR: Input file not found: {input_bed}")
             return {
                 "status": "error",
                 "lifted": 0,
@@ -141,6 +142,7 @@ def liftover_peaks(
         
         # Check if chain file exists
         if not os.path.exists(chain_file):
+            print(f"❌ ERROR: Chain file not found: {chain_file}")
             return {
                 "status": "error",
                 "lifted": 0,
@@ -148,12 +150,40 @@ def liftover_peaks(
                 "message": f"❌ Chain file not found: {chain_file}"
             }
         
+        # Check input file content
+        input_count = sum(1 for _ in open(input_bed))
+        if verbose:
+            print(f"📄 Input file has {input_count:,} lines")
+            # Show first few chromosome names
+            with open(input_bed) as f:
+                first_chroms = [line.split('\t')[0] for line in [next(f, '') for _ in range(3)] if line]
+            print(f"📄 First chromosomes in input: {first_chroms}")
+        
+        # Check chain file chromosome naming
+        if verbose:
+            with open(chain_file) as f:
+                for line in f:
+                    if line.startswith('chain'):
+                        parts = line.split()
+                        if len(parts) > 2:
+                            print(f"📄 Chain file expects chromosomes like: {parts[2]}")
+                        break
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_bed) or '.', exist_ok=True)
+        
+        if verbose:
+            print(f"🔧 Running: {' '.join(cmd)}")
+        
         # Run liftOver
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         
         # Check for errors
         if result.returncode != 0:
             error_msg = result.stderr if result.stderr else result.stdout
+            print(f"❌ liftOver failed with return code {result.returncode}")
+            print(f"   stderr: {result.stderr}")
+            print(f"   stdout: {result.stdout}")
             return {
                 "status": "error",
                 "lifted": 0,
@@ -168,15 +198,27 @@ def liftover_peaks(
         
         # If both are 0, something went wrong
         if lifted_count == 0 and unmapped_count == 0:
-            # Check input file line count
-            input_count = sum(1 for _ in open(input_bed))
+            print(f"⚠️  WARNING: No peaks were processed!")
+            print(f"   Input had {input_count} lines")
+            print(f"   This usually means chromosome names don't match between BED and chain file")
+            print(f"   Check if your BED has 'chr' prefix and chain file expects it (or vice versa)")
+            
+            # Show what chromosomes are in the input
+            with open(input_bed) as f:
+                chroms = set()
+                for i, line in enumerate(f):
+                    if i >= 100:
+                        break
+                    chroms.add(line.split('\t')[0])
+            print(f"   Chromosomes in input (first 100 lines): {sorted(chroms)[:10]}")
+            
             return {
                 "status": "warning",
                 "lifted": 0,
                 "unmapped": 0,
                 "output_file": output_bed,
                 "unmapped_file": unmapped_bed,
-                "message": f"⚠️  No peaks processed. Input had {input_count} lines. Check if file format is correct.",
+                "message": f"⚠️  No peaks processed. Input had {input_count} lines. Chromosome naming mismatch?",
                 "command": " ".join(cmd)
             }
         
@@ -189,6 +231,7 @@ def liftover_peaks(
             "message": f"✅ Lifted {lifted_count:,} peaks, {unmapped_count:,} unmapped"
         }
     except subprocess.CalledProcessError as e:
+        print(f"❌ Subprocess error: {e.stderr}")
         return {
             "status": "error",
             "lifted": 0,
@@ -197,6 +240,9 @@ def liftover_peaks(
             "command": " ".join(cmd)
         }
     except Exception as e:
+        print(f"❌ Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "status": "error",
             "lifted": 0,
