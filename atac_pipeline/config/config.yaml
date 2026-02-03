@@ -1,0 +1,135 @@
+# =============================================================================
+# ATAC-seq Peak Calling Pipeline Configuration
+# =============================================================================
+# This configuration file contains default paths and parameters.
+# Users can override any setting by modifying this file or passing
+# parameters directly to functions.
+#
+# For custom analyses, you can also use the flexible notebook
+# (02_flexible_workflow.ipynb) which allows setting all paths interactively.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Species Selection
+# -----------------------------------------------------------------------------
+species: "Gorilla"  # Options: Human, Bonobo, Macaque, Chimpanzee, Gorilla, Marmoset
+
+# -----------------------------------------------------------------------------
+# Input/Output Directories
+# MODIFY THESE FOR YOUR SETUP
+# -----------------------------------------------------------------------------
+paths:
+  # Base directory for the project
+  base_dir: "/cluster/home/jjanssens/jjans/analysis/adult_intestine/peaks"
+  
+  # Input fragment files (pseudobulk BED files)
+  # Use {species} as placeholder for species name
+  fragments_dir: "../atac/consensus_peak_calling_{species}_filter/pseudobulk_bed_files/"
+  
+  # Output directories (relative to project root or absolute paths)
+  cutsites_dir: "output/{species}/cutsites"
+  peaks_dir: "output/{species}/peaks"
+  lifted_dir: "output/{species}/lifted"
+  consensus_dir: "output/{species}/consensus"
+  bigwig_dir: "output/{species}/bigwigs"
+  
+  # Reference files
+  chromsizes_dir: "/cluster/project/treutlein/USERS/jjans/analysis/adult_intestine/atac/genomes"
+  
+  # Chain files for liftover - UCSC chain files
+  # =========================================================================
+  # CHAIN FILE DIRECTORY (Treutlein lab shared location):
+  # /cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files
+  # =========================================================================
+  chain_dir: "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files"
+  
+  # Blacklist regions (optional, set to null if not using)
+  blacklist: null
+
+# -----------------------------------------------------------------------------
+# MACS3 Peak Calling Parameters
+# -----------------------------------------------------------------------------
+macs3:
+  # Path to MACS3 executable (use "macs3" if in PATH)
+  executable: "/cluster/project/treutlein/jjans/software/miniforge3/envs/scenicplus/bin/macs3"
+  
+  # Peak calling parameters (optimized for ATAC-seq)
+  params:
+    format: "BED"
+    qvalue: 0.01        # FDR threshold for peak calling
+    shift: -73          # Shift reads (negative for ATAC-seq)
+    extsize: 146        # Extension size for reads
+    keep_dup: "all"     # How to handle duplicates
+    min_length: 200     # Minimum peak length
+    nomodel: true       # Skip model building
+    call_summits: true  # Call peak summits
+    nolambda: true      # Use fixed background
+
+# -----------------------------------------------------------------------------
+# Consensus Peak Calling Parameters  
+# -----------------------------------------------------------------------------
+consensus:
+  peak_half_width: 250    # Half-width for peak extension (total = 500bp)
+  q_value_threshold: 0.05 # Q-value filter for input peaks
+  min_peaks_per_sample: 5000  # Minimum peaks to include sample
+
+# -----------------------------------------------------------------------------
+# Parallel Processing
+# -----------------------------------------------------------------------------
+parallel:
+  cutsite_workers: 8    # Workers for fragment conversion (I/O bound)
+  macs3_workers: 15     # Workers for peak calling (CPU bound)
+  liftover_workers: 30  # Workers for liftover (I/O bound)
+  bigwig_workers: 4     # Workers for bigwig generation (memory intensive)
+
+# -----------------------------------------------------------------------------
+# Effective Genome Sizes
+# -----------------------------------------------------------------------------
+genome_sizes:
+  Bonobo: 2595269547
+  Macaque: 2653677440
+  Chimpanzee: 2792339170
+  Gorilla: 2661668758
+  Marmoset: 2597026658
+  Human: 2913022398
+
+# -----------------------------------------------------------------------------
+# Chain Files for Liftover (species -> hg38)
+# =========================================================================
+# Available chain files in:
+# /cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files
+#
+# Species -> hg38:
+#   - gorGor4ToHg38.over.chain      (Gorilla)
+#   - panTro5ToHg38.over.chain      (Chimpanzee)
+#   - panPan2ToHg38.over.chain      (Bonobo)
+#   - rheMac10ToHg38.over.chain     (Macaque)
+#   - calJac4ToHg38.over.chain      (Marmoset - step 2)
+#   - calJac1ToCalJac4.over.chain   (Marmoset - step 1)
+#
+# hg38 -> Species (reverse):
+#   - hg38ToGorGor4.over.chain
+#   - hg38ToPanTro5.over.chain
+#   - hg38ToPanPan2.over.chain
+#   - hg38ToRheMac10.over.chain
+#   - hg38ToCalJac4.over.chain
+# =========================================================================
+chain_files:
+  Bonobo: "panPan2ToHg38.over.chain"
+  Chimpanzee: "panTro5ToHg38.over.chain"
+  Gorilla: "gorGor4ToHg38.over.chain"
+  Macaque: "rheMac10ToHg38.over.chain"
+  # Marmoset requires two-step liftover (calJac1 -> calJac4 -> hg38)
+  Marmoset_step1: "calJac1ToCalJac4.over.chain"
+  Marmoset_step2: "calJac4ToHg38.over.chain"
+
+# -----------------------------------------------------------------------------
+# Chromosome Sizes Files
+# -----------------------------------------------------------------------------
+chromsizes_files:
+  Human: "hg38.chrom.sizes"
+  Gorilla: "Gorilla_gorilla.gorGor4.dna.toplevel.chrom.sizes"
+  Chimpanzee: "Pan_troglodytes.Pan_tro_3.0.dna.toplevel.chrom.sizes"
+  Bonobo: "Pan_paniscus.panpan1.1.dna.toplevel.chrom.sizes"
+  Macaque: "Macaca_mulatta.Mmul_10.dna.toplevel.chrom.sizes"
+  Marmoset: "calJac1.chrom.sizes"

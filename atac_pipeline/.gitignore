@@ -1,0 +1,59 @@
+# =============================================================================
+# ATAC-seq Pipeline - .gitignore
+# =============================================================================
+
+# Output directories
+output/
+results/
+logs/
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# Large data files
+*.bw
+*.bigwig
+*.bam
+*.bai
+*.bed.gz
+*.tsv.gz
+*.narrowPeak
+*.broadPeak
+*.xls
+
+# Keep configuration and example files
+!config/*.yaml
+!config/*.json
+!example/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+env/
+venv/
