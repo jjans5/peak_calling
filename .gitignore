@@ -1,0 +1,44 @@
+# Archive folder (old files)
+_archive/
+
+# Output directories
+output/
+results/
+logs/
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# Large data files
+*.bw
+*.bigwig
+*.bam
+*.bai
+*.bed.gz
+*.tsv.gz
+*.narrowPeak
+*.broadPeak
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

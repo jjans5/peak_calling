@@ -130,11 +130,55 @@ def liftover_peaks(
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # Check if input file exists
+        if not os.path.exists(input_bed):
+            return {
+                "status": "error",
+                "lifted": 0,
+                "unmapped": 0,
+                "message": f"❌ Input file not found: {input_bed}"
+            }
+        
+        # Check if chain file exists
+        if not os.path.exists(chain_file):
+            return {
+                "status": "error",
+                "lifted": 0,
+                "unmapped": 0,
+                "message": f"❌ Chain file not found: {chain_file}"
+            }
+        
+        # Run liftOver
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        
+        # Check for errors
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else result.stdout
+            return {
+                "status": "error",
+                "lifted": 0,
+                "unmapped": 0,
+                "message": f"❌ liftOver failed: {error_msg}",
+                "command": " ".join(cmd)
+            }
         
         # Count results
         lifted_count = sum(1 for _ in open(output_bed)) if os.path.exists(output_bed) else 0
         unmapped_count = sum(1 for _ in open(unmapped_bed)) if os.path.exists(unmapped_bed) else 0
+        
+        # If both are 0, something went wrong
+        if lifted_count == 0 and unmapped_count == 0:
+            # Check input file line count
+            input_count = sum(1 for _ in open(input_bed))
+            return {
+                "status": "warning",
+                "lifted": 0,
+                "unmapped": 0,
+                "output_file": output_bed,
+                "unmapped_file": unmapped_bed,
+                "message": f"⚠️  No peaks processed. Input had {input_count} lines. Check if file format is correct.",
+                "command": " ".join(cmd)
+            }
         
         return {
             "status": "success",
@@ -149,7 +193,16 @@ def liftover_peaks(
             "status": "error",
             "lifted": 0,
             "unmapped": 0,
-            "message": f"❌ Error: {e.stderr}"
+            "message": f"❌ Error: {e.stderr}",
+            "command": " ".join(cmd)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "lifted": 0,
+            "unmapped": 0,
+            "message": f"❌ Unexpected error: {str(e)}",
+            "command": " ".join(cmd)
         }
 
 
