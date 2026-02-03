@@ -90,12 +90,15 @@ def liftover_peaks(
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
     verbose: bool = True,
+    auto_chr: bool = True,
 ) -> Dict[str, Any]:
     """
     Liftover a BED file to a new assembly using UCSC liftOver.
     
     Handles BED files with extra columns (beyond chr, start, end) by
     temporarily extracting coordinates, running liftOver, and rejoining.
+    
+    Automatically handles chromosome naming mismatches (chr1 vs 1).
     
     Parameters
     ----------
@@ -111,6 +114,8 @@ def liftover_peaks(
         Minimum ratio of bases that must remap (default 0.95)
     verbose : bool
         Print chain file info
+    auto_chr : bool
+        Automatically fix chr prefix mismatches (default True)
     
     Returns
     -------
@@ -142,22 +147,36 @@ def liftover_peaks(
     
     # Check input file content
     input_count = sum(1 for _ in open(input_bed))
+    
+    # Get first chromosome from input
+    with open(input_bed) as f:
+        first_line = f.readline().strip()
+        input_chrom = first_line.split('\t')[0] if first_line else ""
+    input_has_chr = input_chrom.startswith('chr')
+    
+    # Get expected chromosome format from chain file
+    chain_has_chr = False
+    with open(chain_file) as f:
+        for line in f:
+            if line.startswith('chain'):
+                parts = line.split()
+                if len(parts) > 2:
+                    chain_has_chr = parts[2].startswith('chr')
+                break
+    
     if verbose:
         print(f"📄 Input file has {input_count:,} lines")
-        # Show first few chromosome names
-        with open(input_bed) as f:
-            first_chroms = [line.split('\t')[0] for line in [next(f, '') for _ in range(3)] if line]
-        print(f"📄 First chromosomes in input: {first_chroms}")
+        print(f"📄 Input chromosomes: {'chr1, chr2...' if input_has_chr else '1, 2...'}")
+        print(f"📄 Chain expects: {'chr1, chr2...' if chain_has_chr else '1, 2...'}")
     
-    # Check chain file chromosome naming
-    if verbose:
-        with open(chain_file) as f:
-            for line in f:
-                if line.startswith('chain'):
-                    parts = line.split()
-                    if len(parts) > 2:
-                        print(f"📄 Chain file expects chromosomes like: {parts[2]}")
-                    break
+    # Determine if we need to fix chromosome naming
+    need_add_chr = auto_chr and chain_has_chr and not input_has_chr
+    need_remove_chr = auto_chr and not chain_has_chr and input_has_chr
+    
+    if need_add_chr and verbose:
+        print(f"🔧 Auto-adding 'chr' prefix to match chain file")
+    elif need_remove_chr and verbose:
+        print(f"🔧 Auto-removing 'chr' prefix to match chain file")
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_bed) or '.', exist_ok=True)
@@ -175,132 +194,109 @@ def liftover_peaks(
             if verbose:
                 print(f"📄 Input has {num_cols} columns")
             
-            # If more than 3 columns, we need to split, liftover, and rejoin
-            if num_cols > 3:
-                if verbose:
-                    print(f"📄 Splitting BED file for liftOver (preserving extra columns)...")
-                
-                bed3_file = os.path.join(tmpdir, "coords.bed")
-                extra_file = os.path.join(tmpdir, "extra.tsv")
-                lifted_bed3 = os.path.join(tmpdir, "lifted.bed")
-                unmapped_tmp = os.path.join(tmpdir, "unmapped.bed")
-                
-                # Split input: BED3 with index, and extra columns with index
-                with open(input_bed) as fin, \
-                     open(bed3_file, 'w') as fbed, \
-                     open(extra_file, 'w') as fextra:
-                    for idx, line in enumerate(fin):
-                        parts = line.rstrip('\n').split('\t')
-                        # Write chr, start, end, and use index as name (4th column)
-                        fbed.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{idx}\n")
-                        # Write extra columns (if any beyond the first 3)
-                        if len(parts) > 3:
-                            fextra.write(f"{idx}\t" + "\t".join(parts[3:]) + "\n")
-                        else:
-                            fextra.write(f"{idx}\n")
-                
-                # Build liftOver command for BED3+name
-                cmd = [
-                    liftover_path,
-                    f"-minMatch={min_match}",
-                    bed3_file,
-                    chain_file,
-                    lifted_bed3,
-                    unmapped_tmp
-                ]
-                
-                if verbose:
-                    print(f"🔧 Running: {' '.join(cmd)}")
-                
-                # Run liftOver
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                
-                if result.returncode != 0:
-                    print(f"❌ liftOver failed with return code {result.returncode}")
-                    print(f"   stderr: {result.stderr}")
-                    print(f"   stdout: {result.stdout}")
-                    return {
-                        "status": "error",
-                        "lifted": 0,
-                        "unmapped": 0,
-                        "message": f"❌ liftOver failed: {result.stderr}",
-                        "command": " ".join(cmd)
-                    }
-                
-                # Read extra columns into dict (idx -> extra columns)
-                extra_cols = {}
-                with open(extra_file) as f:
+            # Prepare files for liftover
+            bed3_file = os.path.join(tmpdir, "coords.bed")
+            extra_file = os.path.join(tmpdir, "extra.tsv")
+            lifted_bed3 = os.path.join(tmpdir, "lifted.bed")
+            unmapped_tmp = os.path.join(tmpdir, "unmapped.bed")
+            
+            if verbose:
+                print(f"📄 Splitting BED file for liftOver (preserving extra columns)...")
+            
+            # Split input: BED3 with index, and extra columns with index
+            # Also handle chr prefix if needed
+            with open(input_bed) as fin, \
+                 open(bed3_file, 'w') as fbed, \
+                 open(extra_file, 'w') as fextra:
+                for idx, line in enumerate(fin):
+                    parts = line.rstrip('\n').split('\t')
+                    chrom = parts[0]
+                    
+                    # Fix chromosome naming if needed
+                    if need_add_chr and not chrom.startswith('chr'):
+                        chrom = 'chr' + chrom
+                    elif need_remove_chr and chrom.startswith('chr'):
+                        chrom = chrom[3:]
+                    
+                    # Write chr, start, end, and use index as name (4th column)
+                    fbed.write(f"{chrom}\t{parts[1]}\t{parts[2]}\t{idx}\n")
+                    # Write extra columns (if any beyond the first 3)
+                    if len(parts) > 3:
+                        fextra.write(f"{idx}\t" + "\t".join(parts[3:]) + "\n")
+                    else:
+                        fextra.write(f"{idx}\n")
+            
+            # Build liftOver command for BED3+name
+            cmd = [
+                liftover_path,
+                f"-minMatch={min_match}",
+                bed3_file,
+                chain_file,
+                lifted_bed3,
+                unmapped_tmp
+            ]
+            
+            if verbose:
+                print(f"🔧 Running liftOver...")
+            
+            # Run liftOver
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            
+            if result.returncode != 0:
+                print(f"❌ liftOver failed with return code {result.returncode}")
+                print(f"   stderr: {result.stderr}")
+                print(f"   stdout: {result.stdout}")
+                return {
+                    "status": "error",
+                    "lifted": 0,
+                    "unmapped": 0,
+                    "message": f"❌ liftOver failed: {result.stderr}",
+                    "command": " ".join(cmd)
+                }
+            
+            # Read extra columns into dict (idx -> extra columns)
+            extra_cols = {}
+            with open(extra_file) as f:
+                for line in f:
+                    parts = line.rstrip('\n').split('\t')
+                    idx = int(parts[0])
+                    extra_cols[idx] = parts[1:] if len(parts) > 1 else []
+            
+            # Read lifted coordinates and rejoin with extra columns
+            # Output will have the TARGET assembly chromosome names (from chain file)
+            lifted_count = 0
+            with open(lifted_bed3) as fin, open(output_bed, 'w') as fout:
+                for line in fin:
+                    parts = line.rstrip('\n').split('\t')
+                    chrom, start, end = parts[0], parts[1], parts[2]
+                    idx = int(parts[3])  # The index we stored as name
+                    
+                    # Get extra columns for this index
+                    extra = extra_cols.get(idx, [])
+                    
+                    # Write output: chr, start, end, extra columns...
+                    if extra:
+                        fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + "\n")
+                    else:
+                        fout.write(f"{chrom}\t{start}\t{end}\n")
+                    lifted_count += 1
+            
+            # Count unmapped
+            unmapped_count = 0
+            if os.path.exists(unmapped_tmp):
+                with open(unmapped_tmp) as f:
                     for line in f:
-                        parts = line.rstrip('\n').split('\t')
-                        idx = int(parts[0])
-                        extra_cols[idx] = parts[1:] if len(parts) > 1 else []
-                
-                # Read lifted coordinates and rejoin with extra columns
-                lifted_count = 0
-                with open(lifted_bed3) as fin, open(output_bed, 'w') as fout:
-                    for line in fin:
-                        parts = line.rstrip('\n').split('\t')
-                        chrom, start, end = parts[0], parts[1], parts[2]
-                        idx = int(parts[3])  # The index we stored as name
-                        
-                        # Get extra columns for this index
-                        extra = extra_cols.get(idx, [])
-                        
-                        # Write output: chr, start, end, extra columns...
-                        if extra:
-                            fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + "\n")
-                        else:
-                            fout.write(f"{chrom}\t{start}\t{end}\n")
-                        lifted_count += 1
-                
-                # Count unmapped (divide by 2 because unmapped file has header lines)
-                unmapped_count = 0
-                if os.path.exists(unmapped_tmp):
-                    with open(unmapped_tmp) as f:
-                        for line in f:
-                            if not line.startswith('#'):
-                                unmapped_count += 1
-                    # Copy unmapped file to final location
-                    import shutil
-                    shutil.copy(unmapped_tmp, unmapped_bed)
-                
-            else:
-                # Simple BED3 file, just run liftOver directly
-                cmd = [
-                    liftover_path,
-                    f"-minMatch={min_match}",
-                    input_bed,
-                    chain_file,
-                    output_bed,
-                    unmapped_bed
-                ]
-                
-                if verbose:
-                    print(f"🔧 Running: {' '.join(cmd)}")
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                
-                if result.returncode != 0:
-                    print(f"❌ liftOver failed with return code {result.returncode}")
-                    print(f"   stderr: {result.stderr}")
-                    print(f"   stdout: {result.stdout}")
-                    return {
-                        "status": "error",
-                        "lifted": 0,
-                        "unmapped": 0,
-                        "message": f"❌ liftOver failed: {result.stderr}",
-                        "command": " ".join(cmd)
-                    }
-                
-                lifted_count = sum(1 for _ in open(output_bed)) if os.path.exists(output_bed) else 0
-                unmapped_count = sum(1 for line in open(unmapped_bed) if not line.startswith('#')) if os.path.exists(unmapped_bed) else 0
+                        if not line.startswith('#'):
+                            unmapped_count += 1
+                # Copy unmapped file to final location
+                import shutil
+                shutil.copy(unmapped_tmp, unmapped_bed)
         
         # Check results
         if lifted_count == 0 and unmapped_count == 0:
             print(f"⚠️  WARNING: No peaks were processed!")
             print(f"   Input had {input_count} lines")
-            print(f"   This usually means chromosome names don't match between BED and chain file")
-            print(f"   Use add_chr_prefix() or remove_chr_prefix() from src.utils to fix naming")
+            print(f"   This is unexpected - check your input file format")
             
             return {
                 "status": "warning",
@@ -308,11 +304,12 @@ def liftover_peaks(
                 "unmapped": 0,
                 "output_file": output_bed,
                 "unmapped_file": unmapped_bed,
-                "message": f"⚠️  No peaks processed. Chromosome naming mismatch?",
+                "message": f"⚠️  No peaks processed.",
             }
         
         if verbose:
-            print(f"✅ Successfully lifted {lifted_count:,} peaks, {unmapped_count:,} unmapped")
+            pct = lifted_count / (lifted_count + unmapped_count) * 100
+            print(f"✅ Successfully lifted {lifted_count:,} peaks ({pct:.1f}%), {unmapped_count:,} unmapped")
         
         return {
             "status": "success",
