@@ -55,6 +55,9 @@ from .utils import (
     get_chromsizes,
     load_config,
     save_parameters,
+    modify_chr_prefix,
+    add_chr_prefix,
+    remove_chr_prefix,
 )
 
 __version__ = "1.0.0"
@@ -92,4 +95,7 @@ __all__ = [
     "get_chromsizes",
     "load_config",
     "save_parameters",
+    "modify_chr_prefix",
+    "add_chr_prefix",
+    "remove_chr_prefix",
 ]

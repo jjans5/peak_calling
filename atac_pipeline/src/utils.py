@@ -303,3 +303,174 @@ def generate_run_report(
         f.write(content)
     
     return output_path
+
+
+# =============================================================================
+# CHROMOSOME NAME UTILITIES
+# =============================================================================
+
+def modify_chr_prefix(
+    input_bed: str,
+    output_bed: str,
+    add_chr: bool = True,
+) -> Dict[str, Any]:
+    """
+    Add or remove 'chr' prefix from chromosome names in BED files.
+    
+    Handles both regular and gzipped BED files. Includes safety checks
+    to prevent double 'chr' prefixes (e.g., 'chrchr1').
+    
+    Parameters
+    ----------
+    input_bed : str
+        Path to input BED file (.bed or .bed.gz)
+    output_bed : str
+        Path to output BED file (.bed or .bed.gz)
+    add_chr : bool, default=True
+        If True, adds 'chr' prefix. If False, removes 'chr' prefix.
+    
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - status: 'success' or 'error'
+        - input: Input file path
+        - output: Output file path
+        - modified: Number of lines modified
+        - total: Total number of lines processed
+        - message: Status message
+    
+    Examples
+    --------
+    >>> # Add chr prefix
+    >>> modify_chr_prefix("peaks.bed", "peaks_chr.bed", add_chr=True)
+    
+    >>> # Remove chr prefix
+    >>> modify_chr_prefix("peaks_chr.bed", "peaks.bed", add_chr=False)
+    """
+    import gzip
+    
+    try:
+        # Determine if input is gzipped
+        is_input_gz = input_bed.endswith('.gz')
+        is_output_gz = output_bed.endswith('.gz')
+        
+        # Open input file
+        if is_input_gz:
+            fin = gzip.open(input_bed, 'rt')
+        else:
+            fin = open(input_bed, 'r')
+        
+        # Open output file
+        if is_output_gz:
+            fout = gzip.open(output_bed, 'wt')
+        else:
+            fout = open(output_bed, 'w')
+        
+        modified_count = 0
+        total_count = 0
+        
+        try:
+            for line in fin:
+                total_count += 1
+                
+                # Skip empty lines and comments
+                if not line.strip() or line.startswith('#') or line.startswith('track'):
+                    fout.write(line)
+                    continue
+                
+                # Split line into fields
+                fields = line.rstrip('\n').split('\t')
+                chrom = fields[0]
+                
+                if add_chr:
+                    # Add chr prefix
+                    if not chrom.startswith('chr'):
+                        # Safety check: ensure we're not adding to something like 'chrchr1'
+                        if 'chrchr' not in chrom.lower():
+                            fields[0] = 'chr' + chrom
+                            modified_count += 1
+                    # If it already has chr, don't modify
+                    # Safety check: fix double chr if it exists
+                    elif chrom.startswith('chrchr'):
+                        fields[0] = chrom.replace('chrchr', 'chr', 1)
+                        modified_count += 1
+                else:
+                    # Remove chr prefix
+                    if chrom.startswith('chr'):
+                        # Safety check: only remove one 'chr' at the start
+                        fields[0] = chrom[3:]  # Remove first 3 characters ('chr')
+                        modified_count += 1
+                        
+                        # Double check for any remaining chr prefix (safety)
+                        if fields[0].startswith('chr'):
+                            fields[0] = fields[0][3:]
+                
+                # Write modified line
+                fout.write('\t'.join(fields) + '\n')
+        
+        finally:
+            fin.close()
+            fout.close()
+        
+        action = "Added" if add_chr else "Removed"
+        return {
+            'status': 'success',
+            'input': input_bed,
+            'output': output_bed,
+            'modified': modified_count,
+            'total': total_count,
+            'message': f"{action} chr prefix for {modified_count}/{total_count} lines",
+        }
+    
+    except Exception as e:
+        return {
+            'status': 'error',
+            'input': input_bed,
+            'output': output_bed,
+            'modified': 0,
+            'total': 0,
+            'message': f"Error: {str(e)}",
+        }
+
+
+def add_chr_prefix(input_bed: str, output_bed: str) -> Dict[str, Any]:
+    """
+    Add 'chr' prefix to chromosome names in BED file.
+    
+    Convenience wrapper for modify_chr_prefix with add_chr=True.
+    
+    Parameters
+    ----------
+    input_bed : str
+        Path to input BED file
+    output_bed : str
+        Path to output BED file
+    
+    Returns
+    -------
+    dict
+        Result dictionary with status and statistics
+    """
+    return modify_chr_prefix(input_bed, output_bed, add_chr=True)
+
+
+def remove_chr_prefix(input_bed: str, output_bed: str) -> Dict[str, Any]:
+    """
+    Remove 'chr' prefix from chromosome names in BED file.
+    
+    Convenience wrapper for modify_chr_prefix with add_chr=False.
+    
+    Parameters
+    ----------
+    input_bed : str
+        Path to input BED file
+    output_bed : str
+        Path to output BED file
+    
+    Returns
+    -------
+    dict
+        Result dictionary with status and statistics
+    """
+    return modify_chr_prefix(input_bed, output_bed, add_chr=False)
