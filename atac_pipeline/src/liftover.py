@@ -332,6 +332,149 @@ def liftover_peaks(
         }
 
 
+def liftover_two_step(
+    input_bed: str,
+    output_bed: str,
+    chain_file_1: str,
+    chain_file_2: str,
+    unmapped_bed: str = None,
+    liftover_path: str = "liftOver",
+    min_match: float = 0.95,
+    auto_chr: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Perform two-step liftover (e.g., calJac1 -> calJac4 -> hg38).
+    
+    Uses a temporary intermediate file between the two liftover steps.
+    
+    Args:
+        input_bed: Path to input BED file
+        output_bed: Path to output BED file (final result)
+        chain_file_1: Path to first chain file (e.g., calJac1ToCalJac4)
+        chain_file_2: Path to second chain file (e.g., calJac4ToHg38)
+        unmapped_bed: Path for unmapped regions (combined from both steps)
+        liftover_path: Path to liftOver executable
+        min_match: Minimum match ratio (0.0-1.0) for both steps
+        auto_chr: Automatically detect and fix chr prefix mismatch
+        verbose: Print detailed progress
+    
+    Returns:
+        Dictionary with status, counts for each step, and file paths
+    """
+    import tempfile
+    
+    if verbose:
+        print(f"🔄 Two-step liftover:")
+        print(f"   Input: {os.path.basename(input_bed)}")
+        print(f"   Step 1: {os.path.basename(chain_file_1)}")
+        print(f"   Step 2: {os.path.basename(chain_file_2)}")
+        print(f"   Output: {os.path.basename(output_bed)}")
+    
+    # Set up unmapped file path
+    if unmapped_bed is None:
+        unmapped_bed = output_bed.replace('.bed', '.unmapped.bed')
+    
+    # Create temporary files for intermediate step
+    with tempfile.TemporaryDirectory() as tmpdir:
+        intermediate_bed = os.path.join(tmpdir, "intermediate.bed")
+        unmapped_step1 = os.path.join(tmpdir, "unmapped_step1.bed")
+        unmapped_step2 = os.path.join(tmpdir, "unmapped_step2.bed")
+        
+        # Step 1: First liftover
+        if verbose:
+            print(f"\n📍 Step 1: {os.path.basename(chain_file_1)}")
+        
+        result1 = liftover_peaks(
+            input_bed=input_bed,
+            output_bed=intermediate_bed,
+            chain_file=chain_file_1,
+            unmapped_bed=unmapped_step1,
+            liftover_path=liftover_path,
+            min_match=min_match,
+            auto_chr=auto_chr,
+            verbose=verbose,
+        )
+        
+        if result1["status"] == "error":
+            return {
+                "status": "error",
+                "step1": result1,
+                "step2": None,
+                "message": f"❌ Step 1 failed: {result1['message']}"
+            }
+        
+        # Step 2: Second liftover
+        if verbose:
+            print(f"\n📍 Step 2: {os.path.basename(chain_file_2)}")
+        
+        result2 = liftover_peaks(
+            input_bed=intermediate_bed,
+            output_bed=output_bed,
+            chain_file=chain_file_2,
+            unmapped_bed=unmapped_step2,
+            liftover_path=liftover_path,
+            min_match=min_match,
+            auto_chr=auto_chr,
+            verbose=verbose,
+        )
+        
+        if result2["status"] == "error":
+            return {
+                "status": "error",
+                "step1": result1,
+                "step2": result2,
+                "message": f"❌ Step 2 failed: {result2['message']}"
+            }
+        
+        # Combine unmapped files
+        with open(unmapped_bed, 'w') as fout:
+            fout.write(f"# Unmapped from step 1 ({os.path.basename(chain_file_1)})\n")
+            if os.path.exists(unmapped_step1):
+                with open(unmapped_step1) as f:
+                    for line in f:
+                        if not line.startswith('#'):
+                            fout.write(line)
+            
+            fout.write(f"\n# Unmapped from step 2 ({os.path.basename(chain_file_2)})\n")
+            if os.path.exists(unmapped_step2):
+                with open(unmapped_step2) as f:
+                    for line in f:
+                        if not line.startswith('#'):
+                            fout.write(line)
+        
+        # Calculate overall statistics
+        original_count = result1["lifted"] + result1["unmapped"]
+        final_lifted = result2["lifted"]
+        total_unmapped = result1["unmapped"] + result2["unmapped"]
+        
+        if original_count > 0:
+            overall_pct = final_lifted / original_count * 100
+        else:
+            overall_pct = 0
+        
+        if verbose:
+            print(f"\n✅ Two-step liftover complete:")
+            print(f"   Original peaks: {original_count:,}")
+            print(f"   After step 1:   {result1['lifted']:,} ({result1['lifted']/original_count*100:.1f}%)" if original_count > 0 else f"   After step 1:   {result1['lifted']:,}")
+            print(f"   After step 2:   {final_lifted:,} ({overall_pct:.1f}%)")
+            print(f"   Total unmapped: {total_unmapped:,}")
+        
+        return {
+            "status": "success",
+            "original": original_count,
+            "lifted": final_lifted,
+            "unmapped_step1": result1["unmapped"],
+            "unmapped_step2": result2["unmapped"],
+            "total_unmapped": total_unmapped,
+            "step1": result1,
+            "step2": result2,
+            "output_file": output_bed,
+            "unmapped_file": unmapped_bed,
+            "message": f"✅ Lifted {final_lifted:,}/{original_count:,} peaks ({overall_pct:.1f}%) through two steps"
+        }
+
+
 def liftover_narrowpeak(
     input_narrowpeak: str,
     output_narrowpeak: str,

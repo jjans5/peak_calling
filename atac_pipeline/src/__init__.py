@@ -32,6 +32,7 @@ from .consensus import (
 
 from .liftover import (
     liftover_peaks,
+    liftover_two_step,
     liftover_fragments_parallel,
     print_chain_info,
     get_chain_file,
@@ -60,6 +61,16 @@ from .utils import (
     remove_chr_prefix,
 )
 
+from .cross_species import (
+    cross_species_consensus_pipeline,
+    merge_bed_files,
+    add_peak_ids,
+    liftback_peaks,
+    create_peak_matrix,
+    get_reverse_chain_file,
+    REVERSE_CHAIN_FILES,
+)
+
 __version__ = "1.0.0"
 __all__ = [
     # Peak calling
@@ -78,11 +89,20 @@ __all__ = [
     "load_narrowpeaks",
     # Liftover
     "liftover_peaks",
+    "liftover_two_step",
     "liftover_fragments_parallel",
     "print_chain_info",
     "get_chain_file",
     "CHAIN_FILES",
     "DEFAULT_CHAIN_DIR",
+    # Cross-species
+    "cross_species_consensus_pipeline",
+    "merge_bed_files",
+    "add_peak_ids",
+    "liftback_peaks",
+    "create_peak_matrix",
+    "get_reverse_chain_file",
+    "REVERSE_CHAIN_FILES",
     # BigWig
     "fragments_to_bigwig",
     "create_bigwig",
