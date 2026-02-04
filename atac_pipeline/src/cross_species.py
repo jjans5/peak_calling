@@ -205,7 +205,8 @@ def liftback_peaks(
     chain_dir: str = DEFAULT_CHAIN_DIR,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
-    min_blocks: float = 1.0,
+    min_blocks: float = None,
+    multiple: bool = False,
     auto_chr: bool = True,
     verbose: bool = True,
     ncpu: int = 1,
@@ -223,7 +224,8 @@ def liftback_peaks(
         chain_dir: Directory containing chain files
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio
-        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
+        min_blocks: Minimum ratio of alignment blocks that must map (optional)
+        multiple: Allow multiple output regions for a single input (default False)
         auto_chr: Auto-fix chromosome prefix
         verbose: Print progress
         ncpu: Number of parallel workers (default 1)
@@ -247,6 +249,7 @@ def liftback_peaks(
             liftover_path=liftover_path,
             min_match=min_match,
             min_blocks=min_blocks,
+            multiple=multiple,
             auto_chr=auto_chr,
             verbose=verbose,
             ncpu=ncpu,
@@ -261,6 +264,7 @@ def liftback_peaks(
             liftover_path=liftover_path,
             min_match=min_match,
             min_blocks=min_blocks,
+            multiple=multiple,
             auto_chr=auto_chr,
             verbose=verbose,
             ncpu=ncpu,
@@ -275,7 +279,8 @@ def cross_species_consensus_pipeline(
     chain_dir: str = DEFAULT_CHAIN_DIR,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
-    min_blocks: float = 1.0,
+    min_blocks: float = None,
+    multiple: bool = False,
     merge_distance: int = 0,
     peak_prefix: str = "unified",
     verbose: bool = True,
@@ -296,7 +301,8 @@ def cross_species_consensus_pipeline(
         chain_dir: Directory containing chain files
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio for liftover
-        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
+        min_blocks: Minimum ratio of alignment blocks that must map (optional)
+        multiple: Allow multiple output regions for a single input (default False)
         merge_distance: Distance for merging peaks (0 = overlapping only)
         peak_prefix: Prefix for peak IDs
         verbose: Print detailed progress
@@ -355,6 +361,7 @@ def cross_species_consensus_pipeline(
                 liftover_path=liftover_path,
                 min_match=min_match,
                 min_blocks=min_blocks,
+                multiple=multiple,
                 auto_chr=True,
                 verbose=verbose,
                 ncpu=ncpu,
@@ -368,6 +375,7 @@ def cross_species_consensus_pipeline(
                 liftover_path=liftover_path,
                 min_match=min_match,
                 min_blocks=min_blocks,
+                multiple=multiple,
                 auto_chr=True,
                 verbose=verbose,
                 ncpu=ncpu,
@@ -440,6 +448,7 @@ def cross_species_consensus_pipeline(
             liftover_path=liftover_path,
             min_match=min_match,
             min_blocks=min_blocks,
+            multiple=multiple,
             auto_chr=True,
             verbose=verbose,
             ncpu=ncpu,

@@ -85,17 +85,22 @@ def get_chain_file(species: str, chain_dir: str = None) -> str:
 
 def _liftover_chunk(args):
     """Worker function to liftover a single chunk."""
-    chunk_bed, chain_file, liftover_path, min_match, min_blocks, output_bed, unmapped_bed = args
+    chunk_bed, chain_file, liftover_path, min_match, min_blocks, multiple, output_bed, unmapped_bed = args
     
     cmd = [
         liftover_path,
         f"-minMatch={min_match}",
-        f"-minBlocks={min_blocks}",
+    ]
+    if min_blocks is not None:
+        cmd.append(f"-minBlocks={min_blocks}")
+    if multiple:
+        cmd.append("-multiple")
+    cmd.extend([
         chunk_bed,
         chain_file,
         output_bed,
         unmapped_bed
-    ]
+    ])
     
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return result.returncode == 0
@@ -107,7 +112,8 @@ def liftover_peaks(
     chain_file: str,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
-    min_blocks: float = 1.0,
+    min_blocks: float = None,
+    multiple: bool = False,
     verbose: bool = True,
     auto_chr: bool = True,
     ncpu: int = 1,
@@ -133,8 +139,10 @@ def liftover_peaks(
         Path to liftOver executable
     min_match : float
         Minimum ratio of bases that must remap (default 0.95)
-    min_blocks : float
-        Minimum ratio of alignment blocks that must map (default 1.0)
+    min_blocks : float, optional
+        Minimum ratio of alignment blocks that must map (default: not used)
+    multiple : bool
+        Allow multiple output regions for a single input (default False)
     verbose : bool
         Print chain file info
     auto_chr : bool
@@ -283,7 +291,7 @@ def liftover_peaks(
                     with open(chunk_bed, 'w') as f:
                         f.writelines(chunk)
                     
-                    chunk_args.append((chunk_bed, chain_file, liftover_path, min_match, min_blocks, chunk_lifted, chunk_unmapped))
+                    chunk_args.append((chunk_bed, chain_file, liftover_path, min_match, min_blocks, multiple, chunk_lifted, chunk_unmapped))
                 
                 # Run in parallel
                 with Pool(ncpu) as pool:
@@ -319,12 +327,17 @@ def liftover_peaks(
                 cmd = [
                     liftover_path,
                     f"-minMatch={min_match}",
-                    f"-minBlocks={min_blocks}",
+                ]
+                if min_blocks is not None:
+                    cmd.append(f"-minBlocks={min_blocks}")
+                if multiple:
+                    cmd.append("-multiple")
+                cmd.extend([
                     bed3_file,
                     chain_file,
                     lifted_bed3,
                     unmapped_tmp
-                ]
+                ])
                 
                 if verbose:
                     print(f"🔧 Running liftOver...")
@@ -429,7 +442,8 @@ def liftover_two_step(
     unmapped_bed: str = None,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
-    min_blocks: float = 1.0,
+    min_blocks: float = None,
+    multiple: bool = False,
     auto_chr: bool = True,
     verbose: bool = True,
     ncpu: int = 1,
@@ -447,7 +461,8 @@ def liftover_two_step(
         unmapped_bed: Path for unmapped regions (combined from both steps)
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio (0.0-1.0) for both steps
-        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
+        min_blocks: Minimum ratio of alignment blocks that must map (optional)
+        multiple: Allow multiple output regions for a single input (default False)
         auto_chr: Automatically detect and fix chr prefix mismatch
         verbose: Print detailed progress
         ncpu: Number of parallel workers (default 1)
@@ -488,6 +503,7 @@ def liftover_two_step(
             liftover_path=liftover_path,
             min_match=min_match,
             min_blocks=min_blocks,
+            multiple=multiple,
             auto_chr=auto_chr,
             verbose=verbose,
             ncpu=ncpu,
@@ -513,6 +529,7 @@ def liftover_two_step(
             liftover_path=liftover_path,
             min_match=min_match,
             min_blocks=min_blocks,
+            multiple=multiple,
             auto_chr=auto_chr,
             verbose=verbose,
             ncpu=ncpu,
