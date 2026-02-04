@@ -83,14 +83,35 @@ def get_chain_file(species: str, chain_dir: str = None) -> str:
 # PEAK LIFTOVER
 # =============================================================================
 
+def _liftover_chunk(args):
+    """Worker function to liftover a single chunk."""
+    chunk_bed, chain_file, liftover_path, min_match, min_blocks, output_bed, unmapped_bed = args
+    
+    cmd = [
+        liftover_path,
+        f"-minMatch={min_match}",
+        f"-minBlocks={min_blocks}",
+        chunk_bed,
+        chain_file,
+        output_bed,
+        unmapped_bed
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return result.returncode == 0
+
+
 def liftover_peaks(
     input_bed: str,
     output_bed: str,
     chain_file: str,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
+    min_blocks: float = 1.0,
     verbose: bool = True,
     auto_chr: bool = True,
+    ncpu: int = 1,
+    unmapped_bed: str = None,
 ) -> Dict[str, Any]:
     """
     Liftover a BED file to a new assembly using UCSC liftOver.
@@ -112,10 +133,16 @@ def liftover_peaks(
         Path to liftOver executable
     min_match : float
         Minimum ratio of bases that must remap (default 0.95)
+    min_blocks : float
+        Minimum ratio of alignment blocks that must map (default 1.0)
     verbose : bool
         Print chain file info
     auto_chr : bool
         Automatically fix chr prefix mismatches (default True)
+    ncpu : int
+        Number of parallel workers (default 1 = sequential)
+    unmapped_bed : str, optional
+        Path for unmapped peaks (default: output_bed with .unmapped.bed suffix)
     
     Returns
     -------
@@ -124,6 +151,8 @@ def liftover_peaks(
     """
     if verbose:
         print(f"🔗 Chain file: {chain_file}")
+        if ncpu > 1:
+            print(f"⚙️  Using {ncpu} parallel workers")
     
     # Check if input file exists
     if not os.path.exists(input_bed):
@@ -182,7 +211,8 @@ def liftover_peaks(
     os.makedirs(os.path.dirname(output_bed) or '.', exist_ok=True)
     
     # Create unmapped output path
-    unmapped_bed = output_bed.replace(".bed", ".unmapped.bed")
+    if unmapped_bed is None:
+        unmapped_bed = output_bed.replace(".bed", ".unmapped.bed")
     
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -226,33 +256,92 @@ def liftover_peaks(
                     else:
                         fextra.write(f"{idx}\n")
             
-            # Build liftOver command for BED3+name
-            cmd = [
-                liftover_path,
-                f"-minMatch={min_match}",
-                bed3_file,
-                chain_file,
-                lifted_bed3,
-                unmapped_tmp
-            ]
-            
-            if verbose:
-                print(f"🔧 Running liftOver...")
-            
-            # Run liftOver
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            
-            if result.returncode != 0:
-                print(f"❌ liftOver failed with return code {result.returncode}")
-                print(f"   stderr: {result.stderr}")
-                print(f"   stdout: {result.stdout}")
-                return {
-                    "status": "error",
-                    "lifted": 0,
-                    "unmapped": 0,
-                    "message": f"❌ liftOver failed: {result.stderr}",
-                    "command": " ".join(cmd)
-                }
+            # Run liftOver (parallel or sequential)
+            if ncpu > 1 and input_count > 1000:
+                # Parallel processing: split into chunks
+                if verbose:
+                    print(f"🚀 Running liftOver in parallel ({ncpu} workers)...")
+                
+                from multiprocessing import Pool
+                import math
+                
+                # Read all lines from bed3 file
+                with open(bed3_file) as f:
+                    all_lines = f.readlines()
+                
+                # Split into chunks
+                chunk_size = math.ceil(len(all_lines) / ncpu)
+                chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
+                
+                # Create chunk files and args
+                chunk_args = []
+                for i, chunk in enumerate(chunks):
+                    chunk_bed = os.path.join(tmpdir, f"chunk_{i}.bed")
+                    chunk_lifted = os.path.join(tmpdir, f"lifted_{i}.bed")
+                    chunk_unmapped = os.path.join(tmpdir, f"unmapped_{i}.bed")
+                    
+                    with open(chunk_bed, 'w') as f:
+                        f.writelines(chunk)
+                    
+                    chunk_args.append((chunk_bed, chain_file, liftover_path, min_match, min_blocks, chunk_lifted, chunk_unmapped))
+                
+                # Run in parallel
+                with Pool(ncpu) as pool:
+                    results = pool.map(_liftover_chunk, chunk_args)
+                
+                if not all(results):
+                    return {
+                        "status": "error",
+                        "lifted": 0,
+                        "unmapped": 0,
+                        "message": "❌ One or more liftOver chunks failed",
+                    }
+                
+                # Merge lifted chunks
+                with open(lifted_bed3, 'w') as fout:
+                    for i in range(len(chunks)):
+                        chunk_lifted = os.path.join(tmpdir, f"lifted_{i}.bed")
+                        if os.path.exists(chunk_lifted):
+                            with open(chunk_lifted) as fin:
+                                fout.write(fin.read())
+                
+                # Merge unmapped chunks
+                with open(unmapped_tmp, 'w') as fout:
+                    for i in range(len(chunks)):
+                        chunk_unmapped = os.path.join(tmpdir, f"unmapped_{i}.bed")
+                        if os.path.exists(chunk_unmapped):
+                            with open(chunk_unmapped) as fin:
+                                for line in fin:
+                                    if not line.startswith('#'):
+                                        fout.write(line)
+            else:
+                # Sequential processing
+                cmd = [
+                    liftover_path,
+                    f"-minMatch={min_match}",
+                    f"-minBlocks={min_blocks}",
+                    bed3_file,
+                    chain_file,
+                    lifted_bed3,
+                    unmapped_tmp
+                ]
+                
+                if verbose:
+                    print(f"🔧 Running liftOver...")
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                
+                if result.returncode != 0:
+                    print(f"❌ liftOver failed with return code {result.returncode}")
+                    print(f"   stderr: {result.stderr}")
+                    print(f"   stdout: {result.stdout}")
+                    return {
+                        "status": "error",
+                        "lifted": 0,
+                        "unmapped": 0,
+                        "message": f"❌ liftOver failed: {result.stderr}",
+                        "command": " ".join(cmd)
+                    }
             
             # Read extra columns into dict (idx -> extra columns)
             extra_cols = {}
@@ -340,8 +429,10 @@ def liftover_two_step(
     unmapped_bed: str = None,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
+    min_blocks: float = 1.0,
     auto_chr: bool = True,
     verbose: bool = True,
+    ncpu: int = 1,
 ) -> Dict[str, Any]:
     """
     Perform two-step liftover (e.g., calJac1 -> calJac4 -> hg38).
@@ -356,8 +447,10 @@ def liftover_two_step(
         unmapped_bed: Path for unmapped regions (combined from both steps)
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio (0.0-1.0) for both steps
+        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
         auto_chr: Automatically detect and fix chr prefix mismatch
         verbose: Print detailed progress
+        ncpu: Number of parallel workers (default 1)
     
     Returns:
         Dictionary with status, counts for each step, and file paths
@@ -370,6 +463,8 @@ def liftover_two_step(
         print(f"   Step 1: {os.path.basename(chain_file_1)}")
         print(f"   Step 2: {os.path.basename(chain_file_2)}")
         print(f"   Output: {os.path.basename(output_bed)}")
+        if ncpu > 1:
+            print(f"   Workers: {ncpu}")
     
     # Set up unmapped file path
     if unmapped_bed is None:
@@ -392,8 +487,10 @@ def liftover_two_step(
             unmapped_bed=unmapped_step1,
             liftover_path=liftover_path,
             min_match=min_match,
+            min_blocks=min_blocks,
             auto_chr=auto_chr,
             verbose=verbose,
+            ncpu=ncpu,
         )
         
         if result1["status"] == "error":
@@ -415,8 +512,10 @@ def liftover_two_step(
             unmapped_bed=unmapped_step2,
             liftover_path=liftover_path,
             min_match=min_match,
+            min_blocks=min_blocks,
             auto_chr=auto_chr,
             verbose=verbose,
+            ncpu=ncpu,
         )
         
         if result2["status"] == "error":

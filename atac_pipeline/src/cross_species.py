@@ -205,8 +205,10 @@ def liftback_peaks(
     chain_dir: str = DEFAULT_CHAIN_DIR,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
+    min_blocks: float = 1.0,
     auto_chr: bool = True,
     verbose: bool = True,
+    ncpu: int = 1,
 ) -> Dict[str, Any]:
     """
     Liftover peaks from hg38 back to a species genome.
@@ -221,8 +223,10 @@ def liftback_peaks(
         chain_dir: Directory containing chain files
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio
+        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
         auto_chr: Auto-fix chromosome prefix
         verbose: Print progress
+        ncpu: Number of parallel workers (default 1)
     
     Returns:
         Dictionary with liftover results
@@ -242,8 +246,10 @@ def liftback_peaks(
             chain_file_2=chain2,
             liftover_path=liftover_path,
             min_match=min_match,
+            min_blocks=min_blocks,
             auto_chr=auto_chr,
             verbose=verbose,
+            ncpu=ncpu,
         )
     else:
         chain_file = get_reverse_chain_file(species, chain_dir)
@@ -254,8 +260,10 @@ def liftback_peaks(
             chain_file=chain_file,
             liftover_path=liftover_path,
             min_match=min_match,
+            min_blocks=min_blocks,
             auto_chr=auto_chr,
             verbose=verbose,
+            ncpu=ncpu,
         )
     
     return result
@@ -267,9 +275,11 @@ def cross_species_consensus_pipeline(
     chain_dir: str = DEFAULT_CHAIN_DIR,
     liftover_path: str = "liftOver",
     min_match: float = 0.95,
+    min_blocks: float = 1.0,
     merge_distance: int = 0,
     peak_prefix: str = "unified",
     verbose: bool = True,
+    ncpu: int = 1,
 ) -> Dict[str, Any]:
     """
     Complete cross-species peak comparison pipeline.
@@ -286,9 +296,11 @@ def cross_species_consensus_pipeline(
         chain_dir: Directory containing chain files
         liftover_path: Path to liftOver executable
         min_match: Minimum match ratio for liftover
+        min_blocks: Minimum ratio of alignment blocks that must map (default 1.0)
         merge_distance: Distance for merging peaks (0 = overlapping only)
         peak_prefix: Prefix for peak IDs
         verbose: Print detailed progress
+        ncpu: Number of parallel workers (default 1)
     
     Returns:
         Dictionary with all results and file paths
@@ -310,6 +322,8 @@ def cross_species_consensus_pipeline(
     
     print("=" * 70)
     print("CROSS-SPECIES CONSENSUS PIPELINE")
+    if ncpu > 1:
+        print(f"⚙️  Using {ncpu} parallel workers")
     print("=" * 70)
     
     # =========================================================================
@@ -340,8 +354,10 @@ def cross_species_consensus_pipeline(
                 chain_file_2=chain2,
                 liftover_path=liftover_path,
                 min_match=min_match,
+                min_blocks=min_blocks,
                 auto_chr=True,
                 verbose=verbose,
+                ncpu=ncpu,
             )
         else:
             chain_file = get_chain_file(species, chain_dir)
@@ -351,8 +367,10 @@ def cross_species_consensus_pipeline(
                 chain_file=chain_file,
                 liftover_path=liftover_path,
                 min_match=min_match,
+                min_blocks=min_blocks,
                 auto_chr=True,
                 verbose=verbose,
+                ncpu=ncpu,
             )
         
         results["lift_to_human"][species] = result
@@ -421,8 +439,10 @@ def cross_species_consensus_pipeline(
             chain_dir=chain_dir,
             liftover_path=liftover_path,
             min_match=min_match,
+            min_blocks=min_blocks,
             auto_chr=True,
             verbose=verbose,
+            ncpu=ncpu,
         )
         
         results["lift_back"][species] = result
