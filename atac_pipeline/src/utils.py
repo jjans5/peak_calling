@@ -671,11 +671,24 @@ def diagnose_bed(
     }
 
 
+# Default main chromosomes for primates
+DEFAULT_MAIN_CHROMS = [
+    '1', '2', '2A', '2B', '3', '4', '5', '6', '7', '8', '9', '10',
+    '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22',
+    'X', 'Y', 'M',
+    'chr1', 'chr2', 'chr2A', 'chr2B', 'chr3', 'chr4', 'chr5', 'chr6', 'chr7', 'chr8', 'chr9', 'chr10',
+    'chr11', 'chr12', 'chr13', 'chr14', 'chr15', 'chr16', 'chr17', 'chr18', 'chr19', 'chr20', 'chr21', 'chr22',
+    'chrX', 'chrY', 'chrM',
+]
+
+
 def compare_bed_files(
     bed_files: Dict[str, str],
     celltype_col: int = None,
+    main_chroms: List[str] = None,
     show_plot: bool = True,
-) -> pd.DataFrame:
+    verbose: bool = True,
+) -> Dict[str, Any]:
     """
     Compare multiple BED files side by side.
     
@@ -685,15 +698,27 @@ def compare_bed_files(
         Dictionary mapping label -> file path
     celltype_col : int, optional
         Column index for cell type information
+    main_chroms : list, optional
+        List of main chromosome names to highlight (default: 1-22, 2A, 2B, X, Y, M with/without chr prefix)
     show_plot : bool
         Whether to display comparison plots
+    verbose : bool
+        Print detailed statistics
     
     Returns
     -------
-    pd.DataFrame
-        Comparison table with statistics for each file
+    dict
+        Dictionary with:
+        - summary_df: Comparison table with statistics for each file
+        - chrom_df: Chromosome counts per file
+        - diagnostics: Full diagnostic results per file
     """
+    if main_chroms is None:
+        main_chroms = DEFAULT_MAIN_CHROMS
+    
     results = []
+    all_chroms = {}  # {label: {chrom: count}}
+    diagnostics = {}
     
     for label, filepath in bed_files.items():
         if not os.path.exists(filepath):
@@ -701,11 +726,20 @@ def compare_bed_files(
             continue
         
         diag = diagnose_bed(filepath, celltype_col=celltype_col, show_plot=False, verbose=False)
+        diagnostics[label] = diag
+        all_chroms[label] = diag['chrom_counts']
+        
+        # Count main vs other chromosomes
+        main_count = sum(count for chrom, count in diag['chrom_counts'].items() if chrom in main_chroms)
+        other_count = sum(count for chrom, count in diag['chrom_counts'].items() if chrom not in main_chroms)
         
         results.append({
             'label': label,
             'n_peaks': diag['n_peaks'],
             'n_chroms': len(diag['chrom_counts']),
+            'main_chroms': main_count,
+            'other_chroms': other_count,
+            'pct_main': main_count / diag['n_peaks'] * 100 if diag['n_peaks'] > 0 else 0,
             'size_min': diag['size_stats']['min'],
             'size_max': diag['size_stats']['max'],
             'size_mean': diag['size_stats']['mean'],
@@ -713,42 +747,133 @@ def compare_bed_files(
             'n_celltypes': len(diag['celltype_counts']) if diag['celltype_counts'] else None,
         })
     
-    df = pd.DataFrame(results)
+    summary_df = pd.DataFrame(results)
     
-    print("=" * 80)
-    print("BED FILE COMPARISON")
-    print("=" * 80)
-    print(df.to_string(index=False))
+    # Build chromosome comparison dataframe
+    all_chrom_names = set()
+    for chrom_counts in all_chroms.values():
+        all_chrom_names.update(chrom_counts.keys())
+    
+    chrom_data = []
+    for chrom in sorted(all_chrom_names, key=lambda x: (
+        0 if x.replace('chr', '') in ['1','2','2A','2B','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22','X','Y','M'] else 1,
+        int(x.replace('chr', '')) if x.replace('chr', '').isdigit() else 100 if x.replace('chr', '') in ['X', 'Y', 'M', '2A', '2B'] else 200,
+        x
+    )):
+        row = {'chrom': chrom, 'is_main': chrom in main_chroms}
+        for label in bed_files.keys():
+            if label in all_chroms:
+                row[label] = all_chroms[label].get(chrom, 0)
+        chrom_data.append(row)
+    
+    chrom_df = pd.DataFrame(chrom_data)
+    
+    if verbose:
+        print("=" * 80)
+        print("BED FILE COMPARISON")
+        print("=" * 80)
+        print("\n📊 SUMMARY STATISTICS")
+        print(summary_df[['label', 'n_peaks', 'main_chroms', 'other_chroms', 'pct_main', 'size_median']].to_string(index=False))
+        
+        print("\n🧬 CHROMOSOME COMPOSITION")
+        # Show main chromosomes
+        main_chrom_df = chrom_df[chrom_df['is_main']].copy()
+        if not main_chrom_df.empty:
+            print("\nMain chromosomes:")
+            print(main_chrom_df.drop(columns=['is_main']).to_string(index=False))
+        
+        # Show other chromosomes summary
+        other_chrom_df = chrom_df[~chrom_df['is_main']].copy()
+        if not other_chrom_df.empty:
+            print(f"\nOther/scaffold chromosomes: {len(other_chrom_df)} unique")
+            label_cols = [col for col in other_chrom_df.columns if col not in ['chrom', 'is_main']]
+            for label in label_cols:
+                total = other_chrom_df[label].sum()
+                print(f"   {label}: {total:,} peaks on scaffolds")
     
     if show_plot and len(results) > 1:
         try:
             import matplotlib.pyplot as plt
+            import numpy as np
             
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             
-            # Peak counts
-            ax1 = axes[0]
-            ax1.bar(df['label'], df['n_peaks'], edgecolor='black', alpha=0.7)
-            ax1.set_ylabel('Number of Peaks')
-            ax1.set_title('Peak Counts by File')
-            ax1.tick_params(axis='x', rotation=45)
-            
-            # Size distributions
-            ax2 = axes[1]
-            x = range(len(df))
+            # Plot 1: Peak counts
+            ax1 = axes[0, 0]
+            labels = summary_df['label']
+            x = np.arange(len(labels))
             width = 0.35
-            ax2.bar([i - width/2 for i in x], df['size_mean'], width, label='Mean', alpha=0.7)
-            ax2.bar([i + width/2 for i in x], df['size_median'], width, label='Median', alpha=0.7)
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(df['label'], rotation=45)
-            ax2.set_ylabel('Peak Size (bp)')
-            ax2.set_title('Peak Size Comparison')
-            ax2.legend()
+            ax1.bar(x - width/2, summary_df['main_chroms'], width, label='Main chroms', alpha=0.8)
+            ax1.bar(x + width/2, summary_df['other_chroms'], width, label='Other/scaffolds', alpha=0.8)
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(labels, rotation=45, ha='right')
+            ax1.set_ylabel('Number of Peaks')
+            ax1.set_title('Peak Counts: Main vs Other Chromosomes')
+            ax1.legend()
+            
+            # Plot 2: Main chromosome composition per file (stacked bar)
+            ax2 = axes[0, 1]
+            main_chrom_df = chrom_df[chrom_df['is_main']].copy()
+            if not main_chrom_df.empty:
+                label_cols = [col for col in main_chrom_df.columns if col not in ['chrom', 'is_main']]
+                # Normalize to percentages
+                chrom_pcts = main_chrom_df.copy()
+                for col in label_cols:
+                    total = chrom_pcts[col].sum()
+                    if total > 0:
+                        chrom_pcts[col] = chrom_pcts[col] / total * 100
+                
+                # Plot grouped bar for each file
+                chroms_to_show = main_chrom_df['chrom'].tolist()
+                x = np.arange(len(chroms_to_show))
+                width = 0.8 / len(label_cols)
+                
+                for i, label in enumerate(label_cols):
+                    offset = (i - len(label_cols)/2 + 0.5) * width
+                    ax2.bar(x + offset, chrom_pcts[label], width, label=label, alpha=0.8)
+                
+                ax2.set_xticks(x)
+                ax2.set_xticklabels(chroms_to_show, rotation=90)
+                ax2.set_ylabel('Percentage of Peaks')
+                ax2.set_title('Main Chromosome Composition (%)')
+                ax2.legend(loc='upper right')
+            
+            # Plot 3: Size distributions
+            ax3 = axes[1, 0]
+            x = np.arange(len(summary_df))
+            width = 0.35
+            ax3.bar(x - width/2, summary_df['size_mean'], width, label='Mean', alpha=0.7)
+            ax3.bar(x + width/2, summary_df['size_median'], width, label='Median', alpha=0.7)
+            ax3.set_xticks(x)
+            ax3.set_xticklabels(summary_df['label'], rotation=45, ha='right')
+            ax3.set_ylabel('Peak Size (bp)')
+            ax3.set_title('Peak Size Comparison')
+            ax3.legend()
+            
+            # Plot 4: Chromosome counts per file (heatmap-style)
+            ax4 = axes[1, 1]
+            main_chrom_df = chrom_df[chrom_df['is_main']].copy()
+            if not main_chrom_df.empty and len(label_cols) > 0:
+                label_cols = [col for col in main_chrom_df.columns if col not in ['chrom', 'is_main']]
+                heatmap_data = main_chrom_df[label_cols].values.T
+                
+                im = ax4.imshow(heatmap_data, aspect='auto', cmap='Blues')
+                ax4.set_xticks(np.arange(len(main_chrom_df)))
+                ax4.set_xticklabels(main_chrom_df['chrom'], rotation=90)
+                ax4.set_yticks(np.arange(len(label_cols)))
+                ax4.set_yticklabels(label_cols)
+                ax4.set_title('Peak Counts Heatmap (Main Chromosomes)')
+                plt.colorbar(im, ax=ax4, label='Count')
             
             plt.tight_layout()
             plt.show()
             
         except ImportError:
-            pass
+            print("⚠️  matplotlib not available, skipping plots")
     
-    return df
+    return {
+        'summary_df': summary_df,
+        'chrom_df': chrom_df,
+        'diagnostics': diagnostics,
+    }
+
