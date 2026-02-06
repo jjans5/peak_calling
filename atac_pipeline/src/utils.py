@@ -474,3 +474,281 @@ def remove_chr_prefix(input_bed: str, output_bed: str) -> Dict[str, Any]:
         Result dictionary with status and statistics
     """
     return modify_chr_prefix(input_bed, output_bed, add_chr=False)
+
+
+# =============================================================================
+# BED FILE DIAGNOSTICS
+# =============================================================================
+
+def diagnose_bed(
+    bed_file: str,
+    name_col: int = None,
+    celltype_col: int = None,
+    show_plot: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Comprehensive diagnostic analysis of a BED file.
+    
+    Provides statistics on peak sizes, chromosome distribution, and 
+    optionally cell type distribution if the column is specified.
+    
+    Parameters
+    ----------
+    bed_file : str
+        Path to BED file
+    name_col : int, optional
+        Column index (0-based) containing peak name/ID
+    celltype_col : int, optional
+        Column index (0-based) containing cell type information
+    show_plot : bool
+        Whether to display plots (default True)
+    verbose : bool
+        Print detailed statistics (default True)
+    
+    Returns
+    -------
+    dict
+        Dictionary with diagnostic statistics:
+        - n_peaks: total number of peaks
+        - size_stats: dict with min, max, mean, median peak sizes
+        - chrom_counts: dict of chromosome -> count
+        - celltype_counts: dict of celltype -> count (if celltype_col provided)
+        - df: pandas DataFrame with all data
+    
+    Example
+    -------
+    >>> diag = diagnose_bed("peaks.bed", celltype_col=3)
+    >>> print(diag['size_stats'])
+    >>> print(diag['celltype_counts'])
+    """
+    import numpy as np
+    
+    if not os.path.exists(bed_file):
+        raise FileNotFoundError(f"BED file not found: {bed_file}")
+    
+    # Read BED file
+    df = pd.read_csv(bed_file, sep='\t', header=None, comment='#')
+    n_cols = len(df.columns)
+    
+    # Assign column names
+    col_names = ['chrom', 'start', 'end']
+    if n_cols > 3:
+        col_names.extend([f'col{i}' for i in range(3, n_cols)])
+    df.columns = col_names[:n_cols]
+    
+    # Calculate peak sizes
+    df['size'] = df['end'] - df['start']
+    
+    # Basic stats
+    n_peaks = len(df)
+    size_stats = {
+        'min': int(df['size'].min()),
+        'max': int(df['size'].max()),
+        'mean': float(df['size'].mean()),
+        'median': float(df['size'].median()),
+        'std': float(df['size'].std()),
+        'q25': float(df['size'].quantile(0.25)),
+        'q75': float(df['size'].quantile(0.75)),
+    }
+    
+    # Chromosome distribution
+    chrom_counts = df['chrom'].value_counts().to_dict()
+    
+    # Cell type distribution (if specified)
+    celltype_counts = None
+    if celltype_col is not None and celltype_col < n_cols:
+        celltype_counts = df.iloc[:, celltype_col].value_counts().to_dict()
+    
+    # Name/ID distribution (if specified)
+    name_counts = None
+    if name_col is not None and name_col < n_cols:
+        name_counts = df.iloc[:, name_col].value_counts().to_dict()
+    
+    if verbose:
+        print("=" * 70)
+        print(f"BED FILE DIAGNOSTICS: {os.path.basename(bed_file)}")
+        print("=" * 70)
+        
+        print(f"\n📊 SUMMARY")
+        print(f"   Total peaks: {n_peaks:,}")
+        print(f"   Columns: {n_cols}")
+        print(f"   File size: {os.path.getsize(bed_file) / 1024 / 1024:.2f} MB")
+        
+        print(f"\n📏 PEAK SIZE DISTRIBUTION")
+        print(f"   Min:    {size_stats['min']:,} bp")
+        print(f"   Max:    {size_stats['max']:,} bp")
+        print(f"   Mean:   {size_stats['mean']:,.1f} bp")
+        print(f"   Median: {size_stats['median']:,.1f} bp")
+        print(f"   Std:    {size_stats['std']:,.1f} bp")
+        print(f"   IQR:    {size_stats['q25']:,.1f} - {size_stats['q75']:,.1f} bp")
+        
+        print(f"\n🧬 CHROMOSOME DISTRIBUTION")
+        # Sort chromosomes naturally
+        sorted_chroms = sorted(chrom_counts.keys(), key=lambda x: (
+            0 if x.replace('chr', '').isdigit() else 1,
+            int(x.replace('chr', '')) if x.replace('chr', '').isdigit() else x
+        ))
+        for chrom in sorted_chroms[:25]:  # Show top 25
+            count = chrom_counts[chrom]
+            pct = count / n_peaks * 100
+            bar = "█" * int(pct / 2)
+            print(f"   {chrom:<8} {count:>8,} ({pct:>5.1f}%) {bar}")
+        if len(sorted_chroms) > 25:
+            print(f"   ... and {len(sorted_chroms) - 25} more chromosomes")
+        
+        if celltype_counts:
+            print(f"\n🔬 CELL TYPE DISTRIBUTION (column {celltype_col})")
+            sorted_ct = sorted(celltype_counts.items(), key=lambda x: -x[1])
+            for ct, count in sorted_ct[:20]:  # Show top 20
+                pct = count / n_peaks * 100
+                bar = "█" * int(pct / 2)
+                print(f"   {str(ct):<30} {count:>8,} ({pct:>5.1f}%) {bar}")
+            if len(sorted_ct) > 20:
+                print(f"   ... and {len(sorted_ct) - 20} more cell types")
+        
+        if name_counts and name_col != celltype_col:
+            n_unique = len(name_counts)
+            print(f"\n🏷️  NAME/ID DISTRIBUTION (column {name_col})")
+            print(f"   Unique values: {n_unique:,}")
+            if n_unique <= 20:
+                for name, count in sorted(name_counts.items(), key=lambda x: -x[1]):
+                    print(f"   {str(name):<30} {count:>8,}")
+    
+    # Plotting
+    if show_plot:
+        try:
+            import matplotlib.pyplot as plt
+            
+            n_plots = 2 + (1 if celltype_counts else 0)
+            fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4))
+            if n_plots == 2:
+                axes = [axes[0], axes[1]]
+            
+            # Plot 1: Peak size distribution
+            ax1 = axes[0]
+            ax1.hist(df['size'], bins=50, edgecolor='black', alpha=0.7)
+            ax1.axvline(size_stats['median'], color='red', linestyle='--', label=f"Median: {size_stats['median']:.0f}")
+            ax1.axvline(size_stats['mean'], color='orange', linestyle='--', label=f"Mean: {size_stats['mean']:.0f}")
+            ax1.set_xlabel('Peak Size (bp)')
+            ax1.set_ylabel('Count')
+            ax1.set_title('Peak Size Distribution')
+            ax1.legend()
+            
+            # Plot 2: Chromosome distribution (top 20)
+            ax2 = axes[1]
+            top_chroms = sorted_chroms[:20]
+            chrom_vals = [chrom_counts[c] for c in top_chroms]
+            ax2.barh(top_chroms[::-1], chrom_vals[::-1], edgecolor='black', alpha=0.7)
+            ax2.set_xlabel('Count')
+            ax2.set_title('Chromosome Distribution')
+            
+            # Plot 3: Cell type distribution (if available)
+            if celltype_counts and n_plots > 2:
+                ax3 = axes[2]
+                sorted_ct = sorted(celltype_counts.items(), key=lambda x: -x[1])[:15]
+                ct_names = [str(ct[0])[:20] for ct in sorted_ct]  # Truncate long names
+                ct_vals = [ct[1] for ct in sorted_ct]
+                ax3.barh(ct_names[::-1], ct_vals[::-1], edgecolor='black', alpha=0.7)
+                ax3.set_xlabel('Count')
+                ax3.set_title('Cell Type Distribution')
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except ImportError:
+            if verbose:
+                print("\n⚠️  matplotlib not available, skipping plots")
+    
+    return {
+        'n_peaks': n_peaks,
+        'n_cols': n_cols,
+        'size_stats': size_stats,
+        'chrom_counts': chrom_counts,
+        'celltype_counts': celltype_counts,
+        'name_counts': name_counts,
+        'df': df,
+    }
+
+
+def compare_bed_files(
+    bed_files: Dict[str, str],
+    celltype_col: int = None,
+    show_plot: bool = True,
+) -> pd.DataFrame:
+    """
+    Compare multiple BED files side by side.
+    
+    Parameters
+    ----------
+    bed_files : dict
+        Dictionary mapping label -> file path
+    celltype_col : int, optional
+        Column index for cell type information
+    show_plot : bool
+        Whether to display comparison plots
+    
+    Returns
+    -------
+    pd.DataFrame
+        Comparison table with statistics for each file
+    """
+    results = []
+    
+    for label, filepath in bed_files.items():
+        if not os.path.exists(filepath):
+            print(f"⚠️  Skipping {label}: file not found")
+            continue
+        
+        diag = diagnose_bed(filepath, celltype_col=celltype_col, show_plot=False, verbose=False)
+        
+        results.append({
+            'label': label,
+            'n_peaks': diag['n_peaks'],
+            'n_chroms': len(diag['chrom_counts']),
+            'size_min': diag['size_stats']['min'],
+            'size_max': diag['size_stats']['max'],
+            'size_mean': diag['size_stats']['mean'],
+            'size_median': diag['size_stats']['median'],
+            'n_celltypes': len(diag['celltype_counts']) if diag['celltype_counts'] else None,
+        })
+    
+    df = pd.DataFrame(results)
+    
+    print("=" * 80)
+    print("BED FILE COMPARISON")
+    print("=" * 80)
+    print(df.to_string(index=False))
+    
+    if show_plot and len(results) > 1:
+        try:
+            import matplotlib.pyplot as plt
+            
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            
+            # Peak counts
+            ax1 = axes[0]
+            ax1.bar(df['label'], df['n_peaks'], edgecolor='black', alpha=0.7)
+            ax1.set_ylabel('Number of Peaks')
+            ax1.set_title('Peak Counts by File')
+            ax1.tick_params(axis='x', rotation=45)
+            
+            # Size distributions
+            ax2 = axes[1]
+            x = range(len(df))
+            width = 0.35
+            ax2.bar([i - width/2 for i in x], df['size_mean'], width, label='Mean', alpha=0.7)
+            ax2.bar([i + width/2 for i in x], df['size_median'], width, label='Median', alpha=0.7)
+            ax2.set_xticks(x)
+            ax2.set_xticklabels(df['label'], rotation=45)
+            ax2.set_ylabel('Peak Size (bp)')
+            ax2.set_title('Peak Size Comparison')
+            ax2.legend()
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except ImportError:
+            pass
+    
+    return df

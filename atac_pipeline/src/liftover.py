@@ -383,16 +383,28 @@ def liftover_peaks(
                         fout.write(f"{chrom}\t{start}\t{end}\n")
                     lifted_count += 1
             
-            # Count unmapped
+            # Process unmapped - rejoin with extra columns
             unmapped_count = 0
             if os.path.exists(unmapped_tmp):
-                with open(unmapped_tmp) as f:
-                    for line in f:
-                        if not line.startswith('#'):
+                with open(unmapped_tmp) as fin, open(unmapped_bed, 'w') as fout:
+                    for line in fin:
+                        if line.startswith('#'):
+                            fout.write(line)
+                            continue
+                        parts = line.rstrip('\n').split('\t')
+                        if len(parts) >= 4:
+                            chrom, start, end = parts[0], parts[1], parts[2]
+                            idx = int(parts[3])  # The index we stored as name
+                            
+                            # Get extra columns for this index
+                            extra = extra_cols.get(idx, [])
+                            
+                            # Write output with extra columns
+                            if extra:
+                                fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + "\n")
+                            else:
+                                fout.write(f"{chrom}\t{start}\t{end}\n")
                             unmapped_count += 1
-                # Copy unmapped file to final location
-                import shutil
-                shutil.copy(unmapped_tmp, unmapped_bed)
         
         # Check results
         if lifted_count == 0 and unmapped_count == 0:

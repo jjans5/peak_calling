@@ -59,6 +59,8 @@ from .utils import (
     modify_chr_prefix,
     add_chr_prefix,
     remove_chr_prefix,
+    diagnose_bed,
+    compare_bed_files,
 )
 
 from .cross_species import (
@@ -118,4 +120,6 @@ __all__ = [
     "modify_chr_prefix",
     "add_chr_prefix",
     "remove_chr_prefix",
+    "diagnose_bed",
+    "compare_bed_files",
 ]
