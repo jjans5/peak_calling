@@ -11,7 +11,7 @@ import yaml
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 
 try:
     import pyranges as pr
