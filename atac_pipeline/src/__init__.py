@@ -60,7 +60,10 @@ from .utils import (
     add_chr_prefix,
     remove_chr_prefix,
     diagnose_bed,
+    diagnose_liftover,
     compare_bed_files,
+    load_peaks,
+    clean_sample_name,
 )
 
 from .cross_species import (
@@ -71,6 +74,13 @@ from .cross_species import (
     create_peak_matrix,
     get_reverse_chain_file,
     REVERSE_CHAIN_FILES,
+)
+
+from .quantification import (
+    quantify,
+    quantify_matrix,
+    save_matrix,
+    load_matrix,
 )
 
 __version__ = "1.0.0"
@@ -105,6 +115,11 @@ __all__ = [
     "create_peak_matrix",
     "get_reverse_chain_file",
     "REVERSE_CHAIN_FILES",
+    # Quantification
+    "quantify",
+    "quantify_matrix",
+    "save_matrix",
+    "load_matrix",
     # BigWig
     "fragments_to_bigwig",
     "create_bigwig",
@@ -121,5 +136,8 @@ __all__ = [
     "add_chr_prefix",
     "remove_chr_prefix",
     "diagnose_bed",
+    "diagnose_liftover",
     "compare_bed_files",
+    "load_peaks",
+    "clean_sample_name",
 ]

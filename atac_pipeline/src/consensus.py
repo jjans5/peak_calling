@@ -211,12 +211,11 @@ def calculate_peaks_and_extend(
     if "Summit" not in narrow_peaks.columns:
         narrow_peaks.Summit = ((narrow_peaks.End - narrow_peaks.Start) / 2).astype(int)
 
-    starts = narrow_peaks.Start + narrow_peaks.Summit - peak_half_width
-    ends = narrow_peaks.Start + narrow_peaks.Summit + peak_half_width 
-    
+    # CRITICAL: Use .values to avoid pandas index alignment issues
+    # PyRanges attributes return Series with their own index, while df.copy() has a different index
     df = narrow_peaks.df.copy()
-    df["Start"] = starts
-    df["End"] = ends
+    df["Start"] = (df["Start"].values + df["Summit"].values - peak_half_width)
+    df["End"] = (df["Start"].values + peak_half_width * 2)  # Start is now the new start, so add full width
     
     # Filter out negative starts
     df = df[df["Start"] >= 0]

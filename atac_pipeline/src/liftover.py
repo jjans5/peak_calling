@@ -243,12 +243,17 @@ def liftover_peaks(
             
             # Split input: BED3 with index, and extra columns with index
             # Also handle chr prefix if needed
+            # Store original (source genome) coordinates for provenance tracking
+            source_coords = {}  # idx -> (orig_chrom, orig_start, orig_end)
             with open(input_bed) as fin, \
                  open(bed3_file, 'w') as fbed, \
                  open(extra_file, 'w') as fextra:
                 for idx, line in enumerate(fin):
                     parts = line.rstrip('\n').split('\t')
                     chrom = parts[0]
+                    
+                    # Save original source-genome coordinates before any prefix fix
+                    source_coords[idx] = (chrom, parts[1], parts[2])
                     
                     # Fix chromosome naming if needed
                     if need_add_chr and not chrom.startswith('chr'):
@@ -366,6 +371,7 @@ def liftover_peaks(
             
             # Read lifted coordinates and rejoin with extra columns
             # Output will have the TARGET assembly chromosome names (from chain file)
+            # Source genome coordinates are appended at the end for provenance
             lifted_count = 0
             with open(lifted_bed3) as fin, open(output_bed, 'w') as fout:
                 for line in fin:
@@ -376,14 +382,19 @@ def liftover_peaks(
                     # Get extra columns for this index
                     extra = extra_cols.get(idx, [])
                     
-                    # Write output: chr, start, end, extra columns...
+                    # Get original source genome coordinates
+                    src_chrom, src_start, src_end = source_coords.get(idx, ('', '', ''))
+                    src_coord_str = f"{src_chrom}:{src_start}-{src_end}"
+                    
+                    # Write output: chr, start, end, extra columns..., source_coord
                     if extra:
-                        fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + "\n")
+                        fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + f"\t{src_coord_str}\n")
                     else:
-                        fout.write(f"{chrom}\t{start}\t{end}\n")
+                        fout.write(f"{chrom}\t{start}\t{end}\t{src_coord_str}\n")
                     lifted_count += 1
             
             # Process unmapped - rejoin with extra columns
+            # Unmapped peaks remain in source genome coordinates
             unmapped_count = 0
             if os.path.exists(unmapped_tmp):
                 with open(unmapped_tmp) as fin, open(unmapped_bed, 'w') as fout:
@@ -399,11 +410,15 @@ def liftover_peaks(
                             # Get extra columns for this index
                             extra = extra_cols.get(idx, [])
                             
-                            # Write output with extra columns
+                            # Get original source genome coordinates
+                            src_chrom, src_start, src_end = source_coords.get(idx, ('', '', ''))
+                            src_coord_str = f"{src_chrom}:{src_start}-{src_end}"
+                            
+                            # Write output with extra columns + source coords
                             if extra:
-                                fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + "\n")
+                                fout.write(f"{chrom}\t{start}\t{end}\t" + "\t".join(extra) + f"\t{src_coord_str}\n")
                             else:
-                                fout.write(f"{chrom}\t{start}\t{end}\n")
+                                fout.write(f"{chrom}\t{start}\t{end}\t{src_coord_str}\n")
                             unmapped_count += 1
         
         # Check results

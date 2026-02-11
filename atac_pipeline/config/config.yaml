@@ -115,8 +115,8 @@ genome_sizes:
 #   - hg38ToCalJac4.over.chain
 # =========================================================================
 chain_files:
-  Bonobo: "panPan2ToHg38.over.chain"
-  Chimpanzee: "panTro5ToHg38.over.chain"
+  Bonobo: "panPan1ToHg38.over.chain"
+  Chimpanzee: "panTro3ToHg38.over.chain"
   Gorilla: "gorGor4ToHg38.over.chain"
   Macaque: "rheMac10ToHg38.over.chain"
   # Marmoset requires two-step liftover (calJac1 -> calJac4 -> hg38)

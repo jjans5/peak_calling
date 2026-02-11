@@ -19,11 +19,12 @@ from collections import defaultdict
 from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR
 
 # Reverse chain files (hg38 → species)
+# NOTE: These must match the assemblies used for the original consensus peaks
 REVERSE_CHAIN_FILES = {
-    "Gorilla": "hg38ToGorGor6.over.chain",
-    "Chimpanzee": "hg38ToPanTro6.over.chain",
-    "Bonobo": "hg38ToPanPan3.over.chain",
-    "Macaque": "hg38ToRheMac10.over.chain",
+    "Gorilla": "hg38ToGorGor4.over.chain",      # hg38 → gorGor4
+    "Chimpanzee": "hg38ToPanTro5.over.chain",   # hg38 → panTro5
+    "Bonobo": "hg38ToPanPan2.over.chain",       # hg38 → panPan2 (matches panpan1.1)
+    "Macaque": "hg38ToRheMac10.over.chain",     # hg38 → rheMac10
     "Marmoset_step1": "hg38ToCalJac4.over.chain",  # hg38 → calJac4
     "Marmoset_step2": "calJac4ToCalJac1.over.chain",  # calJac4 → calJac1
 }

@@ -682,6 +682,362 @@ DEFAULT_MAIN_CHROMS = [
 ]
 
 
+def diagnose_liftover(
+    lifted_bed: str,
+    unmapped_bed: str = None,
+    show_plot: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Diagnostic analysis of a liftover result.
+    
+    Takes a lifted-over BED file and automatically finds its unmapped mate.
+    Compares chromosome distributions between mapped and unmapped peaks,
+    using the source genome coordinates (last column) for the lifted file
+    so both are compared in the same (source) genome coordinate space.
+    
+    Chromosome names are normalised (chr prefix harmonised) so that lifted
+    source coordinates and unmapped coordinates are always merged correctly,
+    even when the original input had a different naming convention than the
+    chain file.
+    
+    Expected file naming convention:
+        Lifted:   Consensus_Peaks_Filtered_500.hg38_Bonobo.bed
+        Unmapped: Consensus_Peaks_Filtered_500.hg38_Bonobo.unmapped.bed
+    
+    The lifted BED file is expected to have a source coordinate column at
+    the very end in the format chr:start-end (added by liftover_peaks).
+    
+    Parameters
+    ----------
+    lifted_bed : str
+        Path to the lifted-over BED file
+    unmapped_bed : str, optional
+        Path to the unmapped BED file. If None, auto-detected by replacing
+        .bed with .unmapped.bed in the lifted file path.
+    show_plot : bool
+        Whether to display diagnostic plots (default True)
+    verbose : bool
+        Print detailed statistics (default True)
+    
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - lifted_total: number of lifted peaks
+        - unmapped_total: number of unmapped peaks
+        - liftover_rate: percentage of peaks successfully lifted
+        - lifted_source_chroms: chromosome distribution in source genome (lifted peaks)
+        - lifted_target_chroms: chromosome distribution in target genome (lifted peaks)
+        - unmapped_chroms: chromosome distribution of unmapped peaks (source genome)
+        - chrom_mapping: dict showing source -> target chromosome mappings
+        - source_chrom_comparison: merged DataFrame comparing lifted vs unmapped per source chrom
+    
+    Example
+    -------
+    >>> diag = diagnose_liftover("peaks.hg38_Bonobo.bed")
+    >>> # Automatically finds peaks.hg38_Bonobo.unmapped.bed
+    >>> print(diag['liftover_rate'])
+    """
+    import re
+    
+    # Helper: normalise a chromosome name so that e.g. "1" and "chr1" become
+    # the same key.  We always normalise to the "chr" form.
+    def _norm_chrom(c: str) -> str:
+        if not c.startswith('chr'):
+            return 'chr' + c
+        return c
+    
+    if not os.path.exists(lifted_bed):
+        raise FileNotFoundError(f"Lifted BED file not found: {lifted_bed}")
+    
+    # Auto-detect unmapped file
+    if unmapped_bed is None:
+        if lifted_bed.endswith('.bed'):
+            unmapped_bed = lifted_bed.replace('.bed', '.unmapped.bed')
+        else:
+            unmapped_bed = lifted_bed + '.unmapped'
+    
+    has_unmapped = os.path.exists(unmapped_bed)
+    
+    if verbose:
+        print("=" * 70)
+        print("LIFTOVER DIAGNOSTICS")
+        print("=" * 70)
+        print(f"📄 Lifted file:   {os.path.basename(lifted_bed)}")
+        if has_unmapped:
+            print(f"📄 Unmapped file: {os.path.basename(unmapped_bed)}")
+        else:
+            print(f"⚠️  Unmapped file not found: {os.path.basename(unmapped_bed)}")
+    
+    # ---- Parse lifted file ----
+    lifted_target_chroms = {}   # target genome chroms (col 0) – raw names
+    lifted_source_chroms = {}   # source genome chroms (normalised)
+    chrom_mapping = {}          # norm_source_chrom -> set of target_chroms
+    lifted_total = 0
+    source_col_found = False
+    
+    with open(lifted_bed) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 3:
+                continue
+            
+            lifted_total += 1
+            target_chrom = parts[0]
+            lifted_target_chroms[target_chrom] = lifted_target_chroms.get(target_chrom, 0) + 1
+            
+            # Try to parse the source coordinate from the last column
+            # Format: chr:start-end or chrom:start-end
+            last_col = parts[-1]
+            m = re.match(r'^(.+):(\d+)-(\d+)$', last_col)
+            if m:
+                source_col_found = True
+                src_chrom_raw = m.group(1)
+                src_chrom = _norm_chrom(src_chrom_raw)
+                lifted_source_chroms[src_chrom] = lifted_source_chroms.get(src_chrom, 0) + 1
+                
+                # Track mapping (normalised source -> raw target)
+                if src_chrom not in chrom_mapping:
+                    chrom_mapping[src_chrom] = set()
+                chrom_mapping[src_chrom].add(target_chrom)
+    
+    if not source_col_found and verbose:
+        print("\n⚠️  No source genome coordinates found in last column.")
+        print("   Expected format: chr:start-end (added by liftover_peaks).")
+        print("   Chromosome comparison will use target genome only.")
+    
+    # ---- Parse unmapped file ----
+    # Unmapped peaks are still in (possibly chr-prefixed) source genome coords.
+    # We normalise to the same namespace as the lifted source chroms.
+    unmapped_chroms = {}        # normalised source chroms
+    unmapped_total = 0
+    
+    if has_unmapped:
+        with open(unmapped_bed) as f:
+            for line in f:
+                if line.startswith('#') or not line.strip():
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 3:
+                    continue
+                
+                unmapped_total += 1
+                chrom = _norm_chrom(parts[0])
+                unmapped_chroms[chrom] = unmapped_chroms.get(chrom, 0) + 1
+    
+    # ---- Calculate statistics ----
+    total_peaks = lifted_total + unmapped_total
+    liftover_rate = (lifted_total / total_peaks * 100) if total_peaks > 0 else 0.0
+    
+    # ---- Build source chromosome comparison ----
+    # Both dicts are now in the same normalised (chr-prefixed) namespace
+    all_source_chroms = set()
+    if source_col_found:
+        all_source_chroms.update(lifted_source_chroms.keys())
+    all_source_chroms.update(unmapped_chroms.keys())
+    
+    def _chrom_sort_key(x):
+        """Sort chromosomes naturally: numeric first, then 2A/2B, then X/Y/M, then scaffolds."""
+        base = x.replace('chr', '')
+        if base.isdigit():
+            return (0, int(base), '')
+        if base in ('2A', '2B'):
+            return (0, 2, base)
+        if base in ('X', 'Y', 'M'):
+            return (1, 0, base)
+        return (2, 0, base)
+    
+    comparison_rows = []
+    for chrom in sorted(all_source_chroms, key=_chrom_sort_key):
+        n_lifted = lifted_source_chroms.get(chrom, 0) if source_col_found else 0
+        n_unmapped = unmapped_chroms.get(chrom, 0)
+        n_total = n_lifted + n_unmapped
+        rate = (n_lifted / n_total * 100) if n_total > 0 else 0
+        maps_to = ', '.join(sorted(chrom_mapping.get(chrom, set()))) if source_col_found else ''
+        comparison_rows.append({
+            'source_chrom': chrom,
+            'lifted': n_lifted,
+            'unmapped': n_unmapped,
+            'total': n_total,
+            'liftover_rate': round(rate, 1),
+            'maps_to': maps_to,
+        })
+    
+    comparison_df = pd.DataFrame(comparison_rows)
+    
+    # ---- Verbose output ----
+    if verbose:
+        print(f"\n📊 OVERALL STATISTICS")
+        print(f"   Total input peaks:   {total_peaks:,}")
+        print(f"   Successfully lifted: {lifted_total:,} ({liftover_rate:.1f}%)")
+        print(f"   Unmapped:            {unmapped_total:,} ({100 - liftover_rate:.1f}%)")
+        
+        if source_col_found:
+            print(f"\n🧬 CHROMOSOME MAPPING (source → target genome)")
+            for src_chrom in sorted(chrom_mapping.keys(), key=_chrom_sort_key):
+                targets = ', '.join(sorted(chrom_mapping[src_chrom]))
+                n = lifted_source_chroms.get(src_chrom, 0)
+                print(f"   {src_chrom:<10} → {targets:<15} ({n:,} peaks)")
+        
+        print(f"\n📋 PER-CHROMOSOME LIFTOVER RATES (source genome)")
+        if not comparison_df.empty:
+            # Filter to main chromosomes for display
+            main_mask = comparison_df['source_chrom'].str.match(
+                r'^(chr)?([\dXYM]+|2[AB])$', case=False
+            )
+            main_df = comparison_df[main_mask].copy()
+            if not main_df.empty:
+                print(main_df.to_string(index=False))
+            
+            other_df = comparison_df[~main_mask]
+            if not other_df.empty:
+                other_lifted = other_df['lifted'].sum()
+                other_unmapped = other_df['unmapped'].sum()
+                other_total = other_df['total'].sum()
+                other_rate = (other_lifted / other_total * 100) if other_total > 0 else 0
+                print(f"\n   Scaffold/other chromosomes: {len(other_df)} unique")
+                print(f"      Total: {other_total:,}  Lifted: {other_lifted:,}  "
+                      f"Unmapped: {other_unmapped:,}  Rate: {other_rate:.1f}%")
+        
+        # Check for noteworthy patterns
+        print(f"\n🔍 NOTABLE OBSERVATIONS")
+        # Check 2A/2B mapping
+        has_2a_2b = any('2A' in c or '2B' in c or '2a' in c or '2b' in c 
+                        for c in all_source_chroms)
+        if has_2a_2b and source_col_found:
+            for variant in ['chr2A', 'chr2B', '2A', '2B']:
+                norm = _norm_chrom(variant)
+                if norm in chrom_mapping:
+                    targets = chrom_mapping[norm]
+                    n_lift = lifted_source_chroms.get(norm, 0)
+                    n_unmap = unmapped_chroms.get(norm, 0)
+                    n_tot = n_lift + n_unmap
+                    rate = (n_lift / n_tot * 100) if n_tot > 0 else 0
+                    print(f"   • {norm} → {', '.join(sorted(targets))} "
+                          f"({n_lift:,}/{n_tot:,} = {rate:.1f}% lifted)")
+        
+        # Flag chromosomes with low liftover rates
+        if not comparison_df.empty:
+            low_rate = comparison_df[
+                (comparison_df['total'] >= 10) & 
+                (comparison_df['liftover_rate'] < 50)
+            ]
+            if not low_rate.empty:
+                print(f"   ⚠️  Low liftover rate (<50%) for:")
+                for _, row in low_rate.iterrows():
+                    print(f"      {row['source_chrom']}: {row['liftover_rate']:.1f}% "
+                          f"({row['lifted']}/{row['total']})")
+            
+            # Flag chromosomes that are 100% unmapped (with >= 10 peaks)
+            fully_unmapped = comparison_df[
+                (comparison_df['total'] >= 10) & 
+                (comparison_df['lifted'] == 0)
+            ]
+            if not fully_unmapped.empty:
+                print(f"   ❌ Fully unmapped chromosomes:")
+                for _, row in fully_unmapped.iterrows():
+                    print(f"      {row['source_chrom']}: {row['total']} peaks, 0 lifted")
+            
+            # Highlight high-rate chromosomes
+            if not main_df.empty:
+                high_rate = main_df[main_df['liftover_rate'] >= 95]
+                if not high_rate.empty:
+                    chroms_str = ', '.join(high_rate['source_chrom'].tolist())
+                    print(f"   ✅ ≥95% liftover: {chroms_str}")
+    
+    # ---- Plotting ----
+    if show_plot:
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            
+            # Plot 1: Overall liftover pie chart
+            ax1 = axes[0]
+            ax1.pie(
+                [lifted_total, unmapped_total],
+                labels=[f'Lifted\n{lifted_total:,}', f'Unmapped\n{unmapped_total:,}'],
+                autopct='%1.1f%%',
+                colors=['#2ecc71', '#e74c3c'],
+                startangle=90,
+                explode=(0.03, 0.03),
+            )
+            ax1.set_title('Liftover Success Rate')
+            
+            # Plot 2: Per-chromosome stacked bar (main chroms only)
+            ax2 = axes[1]
+            if not comparison_df.empty:
+                main_mask = comparison_df['source_chrom'].str.match(
+                    r'^(chr)?([\dXYM]+|2[AB])$', case=False
+                )
+                plot_df = comparison_df[main_mask].copy()
+                if not plot_df.empty:
+                    plot_df = plot_df.sort_values('total', ascending=True)
+                    y = np.arange(len(plot_df))
+                    ax2.barh(y, plot_df['lifted'], color='#2ecc71', label='Lifted')
+                    ax2.barh(y, plot_df['unmapped'], left=plot_df['lifted'], 
+                             color='#e74c3c', label='Unmapped')
+                    ax2.set_yticks(y)
+                    ax2.set_yticklabels(plot_df['source_chrom'])
+                    ax2.set_xlabel('Number of Peaks')
+                    ax2.set_title('Per-Chromosome Breakdown\n(Source Genome)')
+                    ax2.legend(loc='lower right')
+            
+            # Plot 3: Per-chromosome liftover rate with mapping labels
+            ax3 = axes[2]
+            if source_col_found and not comparison_df.empty:
+                main_mask = comparison_df['source_chrom'].str.match(
+                    r'^(chr)?([\dXYM]+|2[AB])$', case=False
+                )
+                main_df = comparison_df[main_mask].copy()
+                if not main_df.empty:
+                    main_df = main_df.sort_values('liftover_rate', ascending=True)
+                    y = np.arange(len(main_df))
+                    colors_bar = ['#e74c3c' if r < 50 else '#f39c12' if r < 90 else '#2ecc71' 
+                                  for r in main_df['liftover_rate']]
+                    ax3.barh(y, main_df['liftover_rate'], color=colors_bar)
+                    ax3.set_yticks(y)
+                    ax3.set_yticklabels(main_df['source_chrom'])
+                    ax3.set_xlabel('Liftover Rate (%)')
+                    ax3.set_xlim(0, 105)
+                    ax3.axvline(x=90, color='green', linestyle='--', alpha=0.5, label='90%')
+                    ax3.axvline(x=50, color='red', linestyle='--', alpha=0.5, label='50%')
+                    ax3.set_title('Per-Chromosome Liftover Rate\n(Source Genome)')
+                    ax3.legend()
+                    
+                    # Add mapping labels
+                    for i, (_, row) in enumerate(main_df.iterrows()):
+                        if row['maps_to']:
+                            ax3.text(row['liftover_rate'] + 1, i, 
+                                     f"→ {row['maps_to']}", va='center', fontsize=7)
+            
+            plt.suptitle(f'Liftover Diagnostics: {os.path.basename(lifted_bed)}', 
+                         fontsize=13, y=1.02)
+            plt.tight_layout()
+            plt.show()
+            
+        except ImportError:
+            if verbose:
+                print("\n⚠️  matplotlib not available, skipping plots")
+    
+    return {
+        'lifted_total': lifted_total,
+        'unmapped_total': unmapped_total,
+        'total_peaks': total_peaks,
+        'liftover_rate': liftover_rate,
+        'lifted_source_chroms': lifted_source_chroms,
+        'lifted_target_chroms': lifted_target_chroms,
+        'unmapped_chroms': unmapped_chroms,
+        'chrom_mapping': {k: sorted(v) for k, v in chrom_mapping.items()},
+        'source_chrom_comparison': comparison_df,
+        'source_col_found': source_col_found,
+    }
+
+
 def compare_bed_files(
     bed_files: Dict[str, str],
     celltype_col: int = None,
@@ -876,4 +1232,88 @@ def compare_bed_files(
         'chrom_df': chrom_df,
         'diagnostics': diagnostics,
     }
+
+
+# =============================================================================
+# BED / PEAK FILE I/O
+# =============================================================================
+
+def load_peaks(
+    peak_file: str,
+    has_header: bool = False,
+) -> pd.DataFrame:
+    """
+    Load peaks from BED file.
+    
+    Parameters
+    ----------
+    peak_file : str
+        Path to BED file with peaks
+    has_header : bool
+        Whether the file has a header row
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with Chromosome, Start, End, and optionally Name columns
+    """
+    header = 0 if has_header else None
+    df = pd.read_csv(peak_file, sep='\t', header=header, comment='#')
+    
+    # Standardize column names
+    if df.shape[1] >= 3:
+        cols = ['Chromosome', 'Start', 'End']
+        if df.shape[1] >= 4:
+            cols.append('Name')
+        if df.shape[1] > 4:
+            cols.extend([f'col_{i}' for i in range(4, df.shape[1])])
+        df.columns = cols
+    
+    # Create region ID if no name
+    if 'Name' not in df.columns:
+        df['Name'] = df['Chromosome'] + ':' + df['Start'].astype(str) + '-' + df['End'].astype(str)
+    
+    return df
+
+
+def clean_sample_name(
+    filepath: str,
+    pattern: Optional[str] = None,
+    replacement: str = "",
+    use_stem: bool = True,
+) -> str:
+    """
+    Clean up sample name from filepath.
+    
+    Parameters
+    ----------
+    filepath : str
+        Path to the input file
+    pattern : str, optional
+        Regex pattern to apply with re.sub
+    replacement : str
+        Replacement string for regex
+    use_stem : bool
+        If True, use only the filename without extension
+        
+    Returns
+    -------
+    str
+        Cleaned sample name
+    """
+    import re
+    
+    if use_stem:
+        name = Path(filepath).stem
+        # Remove common double extensions
+        for ext in ['.fragments', '.tn5', '.insertions', '.sorted', '.filtered']:
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+    else:
+        name = Path(filepath).name
+    
+    if pattern:
+        name = re.sub(pattern, replacement, name)
+    
+    return name
 
