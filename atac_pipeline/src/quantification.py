@@ -37,6 +37,12 @@ try:
 except ImportError:
     _HAS_PYSAM = False
 
+try:
+    import polars as pl
+    _HAS_POLARS = True
+except ImportError:
+    _HAS_POLARS = False
+
 
 # =============================================================================
 # INTERNAL: CHROMOSOME NAME HARMONIZATION
@@ -106,53 +112,184 @@ def _harmonize_chr_prefix(peaks_df: pd.DataFrame, input_file: str, input_type: s
 # INTERNAL: LOW-LEVEL QUANTIFICATION
 # =============================================================================
 
-def _write_temp_bed(peaks_df: pd.DataFrame, suffix: str = ".bed") -> str:
-    """Write peaks to temporary BED file."""
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    peaks_df[['Chromosome', 'Start', 'End', 'Name']].to_csv(
-        path, sep='\t', header=False, index=False
-    )
-    os.close(fd)
-    return path
+def _build_peak_index(peaks_df: pd.DataFrame) -> dict:
+    """Build a per-chromosome sorted interval index for fast overlap counting.
+
+    Returns a dict mapping each chromosome to (starts, ends, row_indices),
+    where starts/ends are sorted numpy arrays and row_indices map back to
+    the original peaks_df row positions.
+
+    RAM: ~20 MB for 900K peaks (3 arrays of int64).
+    """
+    index = {}
+    chroms = peaks_df['Chromosome'].values.astype(str)
+    starts = peaks_df['Start'].values.astype(np.int64)
+    ends = peaks_df['End'].values.astype(np.int64)
+
+    for chrom in np.unique(chroms):
+        mask = chroms == chrom
+        rows = np.where(mask)[0]
+        s = starts[mask]
+        e = ends[mask]
+        # Sort by start position for searchsorted
+        order = np.argsort(s)
+        index[chrom] = (s[order], e[order], rows[order])
+    return index
 
 
-def _count_fragments_coverage(fragments_file: str, peaks_df: pd.DataFrame) -> np.ndarray:
-    """Count fragment coverage over peaks (bedtools intersect -c)."""
-    temp_peaks = _write_temp_bed(peaks_df)
-    try:
-        cmd = f"bedtools intersect -a {temp_peaks} -b {fragments_file} -c"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"bedtools error: {result.stderr}")
-        counts = [int(line.split('\t')[-1]) for line in result.stdout.strip().split('\n') if line]
-        return np.array(counts)
-    finally:
-        os.unlink(temp_peaks)
+def _count_1bp_hits(positions: np.ndarray, peak_starts: np.ndarray,
+                    peak_ends: np.ndarray, peak_rows: np.ndarray,
+                    counts: np.ndarray) -> None:
+    """Vectorized counting of 1bp positions falling within sorted peak intervals.
+
+    For each position p, find peaks where start <= p < end.
+    Uses searchsorted to find the nearest candidate peak, then checks the end
+    boundary. For non-overlapping peaks (the common case) this is a single pass.
+    A depth loop handles overlapping peaks when present.
+
+    This is the inner kernel -- called once per chromosome per chunk.
+    """
+    if len(positions) == 0 or len(peak_starts) == 0:
+        return
+
+    # idx[i] = number of peaks whose start <= positions[i]
+    idx = np.searchsorted(peak_starts, positions, side='right')
+
+    # Depth 1: the most common case (handles all non-overlapping peaks)
+    candidate_idx = idx - 1
+    valid = candidate_idx >= 0
+    if not valid.any():
+        return
+    ci = candidate_idx[valid]
+    vp = positions[valid]
+    hits = peak_ends[ci] > vp  # start <= pos is guaranteed by searchsorted
+    if hits.any():
+        np.add.at(counts, peak_rows[ci[hits]], 1)
+
+    # Depth > 1: only needed when peaks overlap. Check a few more candidates
+    # but bail out aggressively since overlapping peaks are rare.
+    max_depth = min(20, len(peak_starts))
+    for depth in range(2, max_depth + 1):
+        candidate_idx = idx - depth
+        still_valid = candidate_idx >= 0
+        if not still_valid.any():
+            break
+        ci = candidate_idx[still_valid]
+        vp = positions[still_valid]
+        in_range = peak_starts[ci] <= vp
+        if not in_range.any():
+            break
+        hits = in_range & (peak_ends[ci] > vp)
+        if hits.any():
+            np.add.at(counts, peak_rows[ci[hits]], 1)
 
 
-def _count_fragments_cutsites(fragments_file: str, peaks_df: pd.DataFrame) -> np.ndarray:
-    """Count Tn5 cut sites (fragment ends) within peaks."""
-    temp_peaks = _write_temp_bed(peaks_df)
-    fd, temp_cuts = tempfile.mkstemp(suffix=".bed")
-    os.close(fd)
-    try:
-        # Extract both ends of each fragment as cut sites
-        awk_cmd = (
-            f"""awk 'BEGIN{{OFS="\\t"}} {{print $1,$2,$2+1; print $1,$3-1,$3}}' """
-            f"""{fragments_file} > {temp_cuts}"""
+def _count_fragments_coverage(fragments_file: str, peaks_df: Optional[pd.DataFrame] = None,
+                               *, peak_index: Optional[dict] = None,
+                               n_peaks: Optional[int] = None) -> np.ndarray:
+    """Count fragment/cutsite coverage over peaks.
+
+    Uses polars (preferred, ~2x faster) or pandas to parse the fragment file,
+    then groups by chromosome and uses vectorized searchsorted for overlap
+    counting. No temp files, near-zero RAM overhead.
+
+    RAM: peak index (~20 MB) + one file's worth of chrom + start columns.
+    """
+    if peak_index is None:
+        peak_index = _build_peak_index(peaks_df)
+    if n_peaks is None:
+        n_peaks = len(peaks_df) if peaks_df is not None else sum(
+            len(v[0]) for v in peak_index.values())
+    counts = np.zeros(n_peaks, dtype=np.int64)
+
+    if _HAS_POLARS:
+        df = pl.read_csv(
+            fragments_file, separator='\t', has_header=False,
+            columns=[0, 1], new_columns=['c', 's'],
+            schema_overrides={'c': pl.Utf8, 's': pl.Int64},
+            comment_prefix='#',
         )
-        subprocess.run(awk_cmd, shell=True, check=True)
+        for (ch_name,), group in df.group_by('c'):
+            entry = peak_index.get(ch_name)
+            if entry is None:
+                continue
+            positions = group['s'].to_numpy()
+            _count_1bp_hits(positions, entry[0], entry[1], entry[2], counts)
+    else:
+        CHUNK = 500_000
+        reader = pd.read_csv(
+            fragments_file, sep='\t', header=None,
+            usecols=[0, 1], names=['c', 's'],
+            dtype={'c': str, 's': np.int64},
+            comment='#', engine='c',
+            chunksize=CHUNK,
+        )
+        for chunk in reader:
+            chroms = chunk['c'].values
+            starts = chunk['s'].values
+            for ch in np.unique(chroms):
+                entry = peak_index.get(ch)
+                if entry is None:
+                    continue
+                positions = starts[chroms == ch]
+                _count_1bp_hits(positions, entry[0], entry[1], entry[2], counts)
 
-        cmd = f"bedtools intersect -a {temp_peaks} -b {temp_cuts} -c"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"bedtools error: {result.stderr}")
-        counts = [int(line.split('\t')[-1]) for line in result.stdout.strip().split('\n') if line]
-        return np.array(counts)
-    finally:
-        os.unlink(temp_peaks)
-        if os.path.exists(temp_cuts):
-            os.unlink(temp_cuts)
+    return counts
+
+
+def _count_fragments_cutsites(fragments_file: str, peaks_df: Optional[pd.DataFrame] = None,
+                               *, peak_index: Optional[dict] = None,
+                               n_peaks: Optional[int] = None) -> np.ndarray:
+    """Count Tn5 cut sites (both fragment ends) within peaks.
+
+    Extracts both start and end-1 positions from each fragment,
+    then uses the same polars/pandas + searchsorted approach.
+    """
+    if peak_index is None:
+        peak_index = _build_peak_index(peaks_df)
+    if n_peaks is None:
+        n_peaks = len(peaks_df) if peaks_df is not None else sum(
+            len(v[0]) for v in peak_index.values())
+    counts = np.zeros(n_peaks, dtype=np.int64)
+
+    if _HAS_POLARS:
+        df = pl.read_csv(
+            fragments_file, separator='\t', has_header=False,
+            columns=[0, 1, 2], new_columns=['c', 's', 'e'],
+            schema_overrides={'c': pl.Utf8, 's': pl.Int64, 'e': pl.Int64},
+            comment_prefix='#',
+        )
+        for (ch_name,), group in df.group_by('c'):
+            entry = peak_index.get(ch_name)
+            if entry is None:
+                continue
+            starts = group['s'].to_numpy()
+            ends = group['e'].to_numpy() - 1
+            positions = np.concatenate([starts, ends])
+            _count_1bp_hits(positions, entry[0], entry[1], entry[2], counts)
+    else:
+        CHUNK = 500_000
+        reader = pd.read_csv(
+            fragments_file, sep='\t', header=None,
+            usecols=[0, 1, 2], names=['c', 's', 'e'],
+            dtype={'c': str, 's': np.int64, 'e': np.int64},
+            comment='#', engine='c',
+            chunksize=CHUNK,
+        )
+        for chunk in reader:
+            chroms = chunk['c'].values
+            starts = chunk['s'].values
+            ends = chunk['e'].values - 1
+            all_chroms = np.concatenate([chroms, chroms])
+            all_positions = np.concatenate([starts, ends])
+            for ch in np.unique(all_chroms):
+                entry = peak_index.get(ch)
+                if entry is None:
+                    continue
+                positions = all_positions[all_chroms == ch]
+                _count_1bp_hits(positions, entry[0], entry[1], entry[2], counts)
+
+    return counts
 
 
 def _are_fragments_already_cutsites(fragments_file: str, n_check: int = 500) -> bool:
@@ -179,36 +316,24 @@ def _are_fragments_already_cutsites(fragments_file: str, n_check: int = 500) -> 
     return checked > 0
 
 
-def _quantify_fragments(fragments_file, peaks_df, method="coverage"):
-    """Quantify a fragment file over peaks.
-
-    If ``method='cutsites'`` but the fragments are already 1bp cut-sites,
-    automatically falls back to ``coverage`` to avoid double-processing.
-    """
-    if method == "cutsites" and _are_fragments_already_cutsites(fragments_file):
-        print(f"  Auto-detected 1bp cut-site fragments, using 'coverage' instead of 'cutsites'")
-        method = "coverage"
-
+def _quantify_fragments(fragments_file, peaks_df, method="coverage",
+                         peak_index=None, n_peaks=None):
+    """Quantify a fragment file over peaks."""
     if method == "coverage":
-        return _count_fragments_coverage(fragments_file, peaks_df)
+        return _count_fragments_coverage(fragments_file, peaks_df,
+                                         peak_index=peak_index, n_peaks=n_peaks)
     elif method == "cutsites":
-        return _count_fragments_cutsites(fragments_file, peaks_df)
+        return _count_fragments_cutsites(fragments_file, peaks_df,
+                                         peak_index=peak_index, n_peaks=n_peaks)
     else:
         raise ValueError(f"Unknown method '{method}'. Use 'coverage' or 'cutsites'.")
 
 
-def _quantify_tn5_bed(tn5_bed, peaks_df):
-    """Count Tn5 insertions (single-bp BED) within peaks."""
-    temp_peaks = _write_temp_bed(peaks_df)
-    try:
-        cmd = f"bedtools intersect -a {temp_peaks} -b {tn5_bed} -c"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"bedtools error: {result.stderr}")
-        counts = [int(line.split('\t')[-1]) for line in result.stdout.strip().split('\n') if line]
-        return np.array(counts)
-    finally:
-        os.unlink(temp_peaks)
+def _quantify_tn5_bed(tn5_bed, peaks_df, peak_index=None, n_peaks=None):
+    """Count Tn5 insertions (single-bp BED) within peaks.
+    Uses the same streaming coverage approach (1bp entries)."""
+    return _count_fragments_coverage(tn5_bed, peaks_df, peak_index=peak_index,
+                                     n_peaks=n_peaks)
 
 
 def _quantify_bigwig(bigwig_file, peaks_df, stat="mean"):
@@ -231,15 +356,15 @@ def _quantify_bigwig(bigwig_file, peaks_df, stat="mean"):
     return np.array(values)
 
 
-def _dispatch(input_file, peaks_df, input_type, method, stat):
+def _dispatch(input_file, peaks_df, input_type, method, stat,
+              peak_index=None, n_peaks=None):
     """Route to the correct backend based on input_type."""
-    # Ensure peak chromosome names match the input file
-    peaks_df = _harmonize_chr_prefix(peaks_df, input_file, input_type)
-
     if input_type == "fragments":
-        return _quantify_fragments(input_file, peaks_df, method=method)
+        return _quantify_fragments(input_file, peaks_df, method=method,
+                                    peak_index=peak_index, n_peaks=n_peaks)
     elif input_type == "tn5":
-        return _quantify_tn5_bed(input_file, peaks_df)
+        return _quantify_tn5_bed(input_file, peaks_df, peak_index=peak_index,
+                                 n_peaks=n_peaks)
     elif input_type == "bigwig":
         return _quantify_bigwig(input_file, peaks_df, stat=stat)
     else:
@@ -256,14 +381,15 @@ def _dispatch(input_file, peaks_df, input_type, method, stat):
 def _worker_chunk(args):
     """Worker: quantify one chunk of peaks for a single file."""
     chunk_df, input_file, input_type, method, stat = args
-    return _dispatch(input_file, chunk_df, input_type, method, stat)
+    return _dispatch(input_file, chunk_df, input_type, method, stat, peak_index=None)
 
 
 def _worker_file(args):
     """Worker: quantify one file over all peaks. Returns (name, counts)."""
     (input_file, peaks_df, input_type, method, stat,
-     name_pattern, name_replacement, use_stem) = args
-    counts = _dispatch(input_file, peaks_df, input_type, method, stat)
+     name_pattern, name_replacement, use_stem, peak_index, n_peaks) = args
+    counts = _dispatch(input_file, peaks_df, input_type, method, stat,
+                       peak_index=peak_index, n_peaks=n_peaks)
     name = clean_sample_name(
         input_file, pattern=name_pattern,
         replacement=name_replacement, use_stem=use_stem,
@@ -317,12 +443,27 @@ def quantify(
     """
     peaks_df = load_peaks(peak_file)
 
+    # Auto-detect cutsites fragments (check once, not per-chunk)
+    if input_type == "fragments" and method == "cutsites":
+        if _are_fragments_already_cutsites(input_file):
+            if verbose:
+                print("  Auto-detected 1bp cut-site fragments, "
+                      "using 'coverage' instead of 'cutsites'")
+            method = "coverage"
+
+    # Harmonize chr prefix once on the peaks
+    peaks_df = _harmonize_chr_prefix(peaks_df, input_file, input_type)
+
+    # Build peak index once (avoids rebuilding in each worker/call)
+    peak_index = _build_peak_index(peaks_df)
+
     if verbose:
         print(f"Quantifying {Path(input_file).name} ({input_type}) "
               f"over {len(peaks_df):,} peaks...")
 
     if n_chunks <= 1 or n_workers <= 1:
-        counts = _dispatch(input_file, peaks_df, input_type, method, stat)
+        counts = _dispatch(input_file, peaks_df, input_type, method, stat,
+                           peak_index=peak_index, n_peaks=len(peaks_df))
     else:
         chunks = np.array_split(peaks_df, n_chunks)
         args_list = [(c, input_file, input_type, method, stat) for c in chunks]
@@ -408,12 +549,27 @@ def quantify_matrix(
             f"input_files length ({n_files})"
         )
 
+    # Auto-detect cutsites fragments (check first file once)
+    if input_type == "fragments" and method == "cutsites" and n_files > 0:
+        if _are_fragments_already_cutsites(input_files[0]):
+            method = "coverage"
+            if verbose:
+                print("  Auto-detected 1bp cut-site fragments, "
+                      "using 'coverage' instead of 'cutsites'")
+
+    # Harmonize chr prefix once on the peaks (sample first file)
+    if n_files > 0:
+        peaks_df = _harmonize_chr_prefix(peaks_df, input_files[0], input_type)
+
     if verbose:
         print(f"Quantifying {n_files} files over {n_peaks:,} peaks")
         extra = (f" | method: {method}" if input_type == "fragments"
                  else f" | stat: {stat}" if input_type == "bigwig" else "")
         print(f"   Input type: {input_type}{extra}")
         print(f"   Workers: {n_workers}")
+
+    # Build peak index once — passed to all workers to avoid rebuilding
+    peak_index = _build_peak_index(peaks_df)
 
     # --- chunked mode (memory-efficient) ---
     if chunk_size is not None and output_file is not None:
@@ -425,9 +581,12 @@ def quantify_matrix(
         return None
 
     # --- standard mode ---
+    # For fragments/tn5, workers only need peak_index + n_peaks (skip pickling peaks_df).
+    # For bigwig, workers need the actual peaks_df.
+    worker_df = None if input_type in ("fragments", "tn5") else peaks_df
     args_list = [
-        (f, peaks_df, input_type, method, stat,
-         name_pattern, name_replacement, use_stem)
+        (f, worker_df, input_type, method, stat,
+         name_pattern, name_replacement, use_stem, peak_index, n_peaks)
         for f in input_files
     ]
 
@@ -450,7 +609,7 @@ def quantify_matrix(
     df = df.reindex(sorted(df.columns), axis=1)
 
     if verbose:
-        print(f"\n📦 Matrix shape: {df.shape}")
+        print(f"\nMatrix shape: {df.shape}")
 
     if output_file is not None:
         save_matrix(df, output_file, output_format, verbose=verbose)
@@ -473,8 +632,14 @@ def _quantify_matrix_chunked(
     n_files = len(input_files)
     n_chunks = (n_files + chunk_size - 1) // chunk_size
 
+    n_peaks = len(peaks_df)
+
+    # Build peak index once for all batches
+    peak_index = _build_peak_index(peaks_df)
+    worker_df = None if input_type in ("fragments", "tn5") else peaks_df
+
     if verbose:
-        print(f"   📦 Processing in {n_chunks} chunk(s) of ≤{chunk_size} files")
+        print(f"   Processing in {n_chunks} chunk(s) of {chunk_size} files max")
 
     temp_dir = tempfile.mkdtemp(prefix="quant_chunks_")
     temp_paths = []
@@ -489,8 +654,8 @@ def _quantify_matrix_chunked(
                       f"({len(batch_files)} files)...")
 
             args_list = [
-                (f, peaks_df, input_type, method, stat,
-                 name_pattern, name_replacement, use_stem)
+                (f, worker_df, input_type, method, stat,
+                 name_pattern, name_replacement, use_stem, peak_index, n_peaks)
                 for f in batch_files
             ]
 
@@ -515,7 +680,7 @@ def _quantify_matrix_chunked(
 
         # merge
         if verbose:
-            print(f"\n   🔗 Merging {len(temp_paths)} chunk(s)...")
+            print(f"\n   Merging {len(temp_paths)} chunk(s)...")
 
         merged = None
         for tp in temp_paths:
