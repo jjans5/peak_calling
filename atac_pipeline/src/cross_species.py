@@ -19,7 +19,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from collections import defaultdict
 
 import pandas as pd
@@ -43,8 +43,7 @@ DEFAULT_GTF_FILES = {
     "Gorilla": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/gorGor4/genes/genes.gtf",
     "Macaque": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/Mmul10/genes/genes.gtf",
     "Marmoset": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/calJac1_mito/genes/genes.gtf",
-    # Chimpanzee: panTro5 assembly peaks, using panTro3 refGene as closest available
-    "Chimpanzee": "/cluster/home/jjanssens/jjans/analysis/cerebellum/genomes_new/pan_troglodytes/panTro3.refGene.gtf.gz",
+    "Chimpanzee": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/panTro3/genes/genes.gtf.gz",
 }
 
 
@@ -330,6 +329,33 @@ def find_species_specific_peaks(
                     parts = line.strip().split('\t')
                     fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
 
+        # Detect and fix chr prefix mismatch between original and liftback
+        def _first_chrom(path: str) -> str:
+            with open(path) as fh:
+                for line in fh:
+                    if line.strip() and not line.startswith('#'):
+                        return line.split('\t')[0]
+            return ""
+
+        orig_chrom = _first_chrom(orig_bed3)
+        liftback_chrom = _first_chrom(liftback_bed3)
+        orig_has_chr = orig_chrom.startswith("chr")
+        liftback_has_chr = liftback_chrom.startswith("chr")
+
+        if orig_has_chr != liftback_has_chr:
+            # Harmonize liftback to match original
+            liftback_fixed = os.path.join(tmpdir, "liftback_fixed.bed")
+            with open(liftback_bed3) as fin, open(liftback_fixed, 'w') as fout:
+                for line in fin:
+                    if line.strip():
+                        if orig_has_chr and not liftback_has_chr:
+                            fout.write("chr" + line)
+                        else:
+                            fout.write(line[3:] if line.startswith("chr") else line)
+            liftback_bed3 = liftback_fixed
+            if verbose:
+                print(f"      (harmonized chr prefix: liftback {'added' if orig_has_chr else 'stripped'} chr)")
+
         liftback_sorted = os.path.join(tmpdir, "liftback_sorted.bed")
         liftback_merged = os.path.join(tmpdir, "liftback_merged.bed")
         subprocess.run(f"sort -k1,1 -k2,2n {liftback_bed3} > {liftback_sorted}", shell=True, check=True)
@@ -474,6 +500,39 @@ def annotate_with_closest_gene(
         DataFrame with peak_id, closest_gene, distance_to_gene
     """
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Detect chr prefix in peaks vs gene BED and harmonize
+        def _first_chrom(path: str) -> str:
+            with open(path) as fh:
+                for line in fh:
+                    if line.strip() and not line.startswith('#'):
+                        return line.split('\t')[0]
+            return ""
+
+        peak_chrom = _first_chrom(peaks_bed)
+        gene_chrom = _first_chrom(gene_bed)
+        peaks_have_chr = peak_chrom.startswith("chr")
+        genes_have_chr = gene_chrom.startswith("chr")
+
+        # If mismatch, create a harmonized gene BED with matching chr convention
+        if peaks_have_chr and not genes_have_chr:
+            gene_bed_fixed = os.path.join(tmpdir, "genes_chr.bed")
+            with open(gene_bed) as fin, open(gene_bed_fixed, 'w') as fout:
+                for line in fin:
+                    if line.strip():
+                        fout.write("chr" + line)
+            gene_bed = gene_bed_fixed
+            if verbose:
+                print(f"   (added chr prefix to gene BED for matching)")
+        elif not peaks_have_chr and genes_have_chr:
+            gene_bed_fixed = os.path.join(tmpdir, "genes_nochr.bed")
+            with open(gene_bed) as fin, open(gene_bed_fixed, 'w') as fout:
+                for line in fin:
+                    if line.strip():
+                        fout.write(line[3:] if line.startswith("chr") else line)
+            gene_bed = gene_bed_fixed
+            if verbose:
+                print(f"   (stripped chr prefix from gene BED for matching)")
+
         # Ensure peaks are sorted
         peaks_sorted = os.path.join(tmpdir, "peaks_sorted.bed")
         subprocess.run(f"sort -k1,1 -k2,2n {peaks_bed} > {peaks_sorted}", shell=True, check=True)
@@ -842,6 +901,656 @@ def create_peak_annotation(
 
 
 # =============================================================================
+# MASTER ANNOTATION TABLE
+# =============================================================================
+
+def build_master_annotation(
+    unified_bed: str,
+    human_specific_bed: str,
+    species_specific_beds: Dict[str, str],
+    liftback_dir: str,
+    gene_bed_dir: str,
+    human_gene_annotation_tsv: str,
+    species_list: List[str],
+    output_file: str,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Build a comprehensive master annotation table with one row per peak.
+
+    Columns:
+      - peak_id (index)
+      - peak_type: 'unified', 'human_specific', '{species}_specific'
+      - Human_chr, Human_start, Human_end (hg38 coords for unified/hs peaks)
+      - {Species}_chr, {Species}_start, {Species}_end (liftback coords)
+      - Human_gene, Human_gene_dist
+      - {Species}_gene, {Species}_gene_dist (from bedtools closest on liftback)
+      - Human_det, Bonobo_det, ... (binary 0/1 from species_detected column)
+      - n_species (count of detected species)
+
+    For species-specific peaks, only the native species coords are populated.
+    """
+    if verbose:
+        print("Building master annotation table...")
+
+    all_rows = []
+
+    # ------------------------------------------------------------------
+    # 1. Unified peaks -- hg38 coords + species detection
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  1. Loading unified peaks + human gene annotation...")
+
+    # Load human gene annotation
+    human_gene_map = {}
+    if os.path.exists(human_gene_annotation_tsv):
+        hg = pd.read_csv(human_gene_annotation_tsv, sep="\t")
+        human_gene_map = dict(zip(
+            hg["peak_id"],
+            zip(hg["closest_gene"], hg["distance_to_gene"]),
+        ))
+
+    with open(unified_bed) as f:
+        for line in f:
+            if line.strip() and not line.startswith("#"):
+                parts = line.strip().split("\t")
+                pid = parts[3]
+                species_detected = parts[4] if len(parts) > 4 else "Human"
+                row = {
+                    "peak_id": pid,
+                    "peak_type": "unified",
+                    "Human_chr": parts[0],
+                    "Human_start": int(parts[1]),
+                    "Human_end": int(parts[2]),
+                    "species_detected": species_detected,
+                }
+                if pid in human_gene_map:
+                    row["Human_gene"] = human_gene_map[pid][0]
+                    row["Human_gene_dist"] = int(human_gene_map[pid][1])
+                all_rows.append(row)
+
+    # ------------------------------------------------------------------
+    # 2. Human-specific peaks
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  2. Loading human-specific peaks...")
+
+    if os.path.exists(human_specific_bed):
+        # Load human-specific gene annotation if it exists
+        hs_gene_tsv = os.path.join(
+            os.path.dirname(human_gene_annotation_tsv),
+            "human_specific_gene_annotation.tsv",
+        )
+        hs_gene_map = {}
+        if os.path.exists(hs_gene_tsv):
+            hsg = pd.read_csv(hs_gene_tsv, sep="\t")
+            hs_gene_map = dict(zip(
+                hsg["peak_id"],
+                zip(hsg["closest_gene"], hsg["distance_to_gene"]),
+            ))
+
+        with open(human_specific_bed) as f:
+            for line in f:
+                if line.strip() and not line.startswith("#"):
+                    parts = line.strip().split("\t")
+                    pid = parts[3] if len(parts) > 3 else f"{parts[0]}:{parts[1]}-{parts[2]}"
+                    row = {
+                        "peak_id": pid,
+                        "peak_type": "human_specific",
+                        "Human_chr": parts[0],
+                        "Human_start": int(parts[1]),
+                        "Human_end": int(parts[2]),
+                        "species_detected": "Human",
+                    }
+                    if pid in hs_gene_map:
+                        row["Human_gene"] = hs_gene_map[pid][0]
+                        row["Human_gene_dist"] = int(hs_gene_map[pid][1])
+                    all_rows.append(row)
+
+    # ------------------------------------------------------------------
+    # 3. Liftback coordinates for unified peaks
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  3. Loading liftback coordinates per species...")
+
+    for species in species_list:
+        lb_file = os.path.join(liftback_dir, f"unified_consensus_{species}.bed")
+        if not os.path.exists(lb_file):
+            continue
+
+        # Build map: peak_id -> (chr, start, end) in species coords
+        lb_map = {}
+        with open(lb_file) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 4:
+                    lb_map[parts[3]] = (parts[0], int(parts[1]), int(parts[2]))
+
+        # Merge into rows
+        for row in all_rows:
+            if row["peak_type"] == "unified" and row["peak_id"] in lb_map:
+                c, s, e = lb_map[row["peak_id"]]
+                row[f"{species}_chr"] = c
+                row[f"{species}_start"] = s
+                row[f"{species}_end"] = e
+
+        if verbose:
+            print(f"    {species}: {len(lb_map):,} liftback coords")
+
+    # ------------------------------------------------------------------
+    # 4. Species gene annotation on liftback coords
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  4. Annotating liftback peaks with species genes...")
+
+    for species in species_list:
+        lb_file = os.path.join(liftback_dir, f"unified_consensus_{species}.bed")
+        gene_bed = os.path.join(gene_bed_dir, f"{species}_genes.bed")
+        if not os.path.exists(lb_file) or not os.path.exists(gene_bed):
+            continue
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Harmonize chr prefix
+            with open(lb_file) as f:
+                lb_chr = f.readline().split("\t")[0]
+            with open(gene_bed) as f:
+                gene_chr = f.readline().split("\t")[0]
+
+            gene_bed_use = gene_bed
+            if lb_chr.startswith("chr") and not gene_chr.startswith("chr"):
+                gene_bed_use = os.path.join(tmpdir, "genes_chr.bed")
+                with open(gene_bed) as fin, open(gene_bed_use, "w") as fout:
+                    for line in fin:
+                        if line.strip():
+                            fout.write("chr" + line)
+            elif not lb_chr.startswith("chr") and gene_chr.startswith("chr"):
+                gene_bed_use = os.path.join(tmpdir, "genes_nochr.bed")
+                with open(gene_bed) as fin, open(gene_bed_use, "w") as fout:
+                    for line in fin:
+                        if line.strip():
+                            fout.write(line[3:] if line.startswith("chr") else line)
+
+            lb_sorted = os.path.join(tmpdir, "lb_sorted.bed")
+            gene_sorted = os.path.join(tmpdir, "gene_sorted.bed")
+            subprocess.run(f"sort -k1,1 -k2,2n {lb_file} > {lb_sorted}", shell=True, check=True)
+            subprocess.run(f"sort -k1,1 -k2,2n {gene_bed_use} > {gene_sorted}", shell=True, check=True)
+
+            closest_out = os.path.join(tmpdir, "closest.tsv")
+            subprocess.run(
+                f"bedtools closest -a {lb_sorted} -b {gene_sorted} -d -t first > {closest_out}",
+                shell=True, check=True,
+            )
+
+            with open(lb_sorted) as f:
+                n_lb_cols = len(f.readline().strip().split("\t"))
+
+            sp_gene_map = {}
+            with open(closest_out) as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) < n_lb_cols + 7:
+                        continue
+                    pid = parts[3]
+                    gene_name = parts[n_lb_cols + 3]
+                    dist = int(parts[-1]) if parts[-1] != "." else -1
+                    sp_gene_map[pid] = (gene_name, dist)
+
+        for row in all_rows:
+            if row["peak_id"] in sp_gene_map:
+                row[f"{species}_gene"] = sp_gene_map[row["peak_id"]][0]
+                row[f"{species}_gene_dist"] = sp_gene_map[row["peak_id"]][1]
+
+        if verbose:
+            print(f"    {species}: {len(sp_gene_map):,} gene annotations")
+
+    # ------------------------------------------------------------------
+    # 5. Species-specific peaks
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  5. Loading species-specific peaks + gene annotation...")
+
+    for species, sp_bed in species_specific_beds.items():
+        if not os.path.exists(sp_bed):
+            continue
+
+        sp_gene_tsv = os.path.join(
+            os.path.dirname(human_gene_annotation_tsv),
+            f"{species}_specific_gene_annotation.tsv",
+        )
+        sp_gene_map = {}
+        if os.path.exists(sp_gene_tsv):
+            sg = pd.read_csv(sp_gene_tsv, sep="\t")
+            sp_gene_map = dict(zip(
+                sg["peak_id"],
+                zip(sg["closest_gene"], sg["distance_to_gene"]),
+            ))
+
+        with open(sp_bed) as f:
+            for line in f:
+                if line.strip() and not line.startswith("#"):
+                    parts = line.strip().split("\t")
+                    pid = parts[3] if len(parts) > 3 else f"{parts[0]}:{parts[1]}-{parts[2]}"
+                    row = {
+                        "peak_id": pid,
+                        "peak_type": f"{species.lower()}_specific",
+                        f"{species}_chr": parts[0],
+                        f"{species}_start": int(parts[1]),
+                        f"{species}_end": int(parts[2]),
+                        "species_detected": species,
+                    }
+                    if pid in sp_gene_map:
+                        row[f"{species}_gene"] = sp_gene_map[pid][0]
+                        row[f"{species}_gene_dist"] = int(sp_gene_map[pid][1])
+                    all_rows.append(row)
+
+    # ------------------------------------------------------------------
+    # 6. Build DataFrame and add binary detection columns
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  6. Building DataFrame with binary detection columns...")
+
+    all_species = ["Human"] + species_list
+    df = pd.DataFrame(all_rows)
+
+    # Binary detection columns from species_detected
+    for sp in all_species:
+        col = f"{sp}_det"
+        df[col] = df["species_detected"].str.contains(sp, na=False).astype(int)
+
+    df["n_species"] = df[[f"{sp}_det" for sp in all_species]].sum(axis=1)
+
+    # Reorder columns for clarity
+    base_cols = ["peak_id", "peak_type", "species_detected", "n_species"]
+    det_cols = [f"{sp}_det" for sp in all_species]
+
+    coord_cols = []
+    gene_cols = []
+    for sp in all_species:
+        coord_cols.extend([f"{sp}_chr", f"{sp}_start", f"{sp}_end"])
+        gene_cols.extend([f"{sp}_gene", f"{sp}_gene_dist"])
+
+    ordered = base_cols + det_cols + coord_cols + gene_cols
+    # Only keep columns that actually exist
+    ordered = [c for c in ordered if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered]
+    df = df[ordered + remaining]
+
+    df = df.set_index("peak_id")
+
+    # ------------------------------------------------------------------
+    # 7. Save
+    # ------------------------------------------------------------------
+    df.to_csv(output_file, sep="\t")
+
+    if verbose:
+        print(f"\n  Master annotation saved: {output_file}")
+        print(f"  Total peaks: {len(df):,}")
+        print(f"  Columns: {len(df.columns)}")
+        print(f"  Peak types: {df['peak_type'].value_counts().to_dict()}")
+        print(f"\n  Detection summary:")
+        for sp in all_species:
+            col = f"{sp}_det"
+            if col in df.columns:
+                print(f"    {sp}: {df[col].sum():,} peaks")
+
+    return df
+
+
+# =============================================================================
+# CROSS-MAPPING SPECIES-SPECIFIC PEAKS VIA DIRECT CHAINS
+# =============================================================================
+
+# Direct inter-species liftover routes (avoiding hg38, since species-specific
+# peaks already failed the hg38 round-trip).
+# Each route is a list of chain file basenames to apply sequentially.
+# Assembly mapping: Bonobo=panPan2, Chimpanzee=panTro5, Gorilla=gorGor4,
+#                   Macaque=rheMac10, Marmoset=calJac1
+CROSS_SPECIES_ROUTES = {
+    # --- Bonobo (panPan2) -> others ---
+    ("Bonobo", "Chimpanzee"):  ["panPan2ToPanTro4.over.chain", "panTro4ToPanTro5.over.chain"],
+    ("Bonobo", "Gorilla"):     ["panPan2ToGorGor5.over.chain", "gorGor5ToGorGor4.over.chain"],
+    ("Bonobo", "Macaque"):     ["panPan2ToPanTro4.over.chain", "panTro4ToPanTro5.over.chain",
+                                "panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain"],
+    ("Bonobo", "Marmoset"):    ["panPan2ToPanTro4.over.chain", "panTro4ToPanTro5.over.chain",
+                                "panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain",
+                                "rheMac10ToCalJac4.over.chain", "calJac4ToCalJac1.over.chain"],
+
+    # --- Chimpanzee (panTro5) -> others ---
+    ("Chimpanzee", "Bonobo"):  ["panTro5ToPanTro4.over.chain", "panTro4ToPanPan2.over.chain"],
+    ("Chimpanzee", "Gorilla"): ["panTro5ToGorGor5.over.chain", "gorGor5ToGorGor4.over.chain"],
+    ("Chimpanzee", "Macaque"): ["panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain"],
+    ("Chimpanzee", "Marmoset"):["panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain",
+                                "rheMac10ToCalJac4.over.chain", "calJac4ToCalJac1.over.chain"],
+
+    # --- Gorilla (gorGor4) -> others ---
+    ("Gorilla", "Bonobo"):     ["gorGor4ToGorGor5.over.chain", "gorGor5ToPanPan2.over.chain"],
+    ("Gorilla", "Chimpanzee"): ["gorGor4ToGorGor5.over.chain", "gorGor5ToPanTro5.over.chain"],
+    ("Gorilla", "Macaque"):    ["gorGor4ToGorGor5.over.chain", "gorGor5ToPanTro5.over.chain",
+                                "panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain"],
+    ("Gorilla", "Marmoset"):   ["gorGor4ToGorGor5.over.chain", "gorGor5ToPanTro5.over.chain",
+                                "panTro5ToRheMac8.over.chain", "rheMac8ToRheMac10.over.chain",
+                                "rheMac10ToCalJac4.over.chain", "calJac4ToCalJac1.over.chain"],
+
+    # --- Macaque (rheMac10) -> others ---
+    ("Macaque", "Chimpanzee"): ["rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain"],
+    ("Macaque", "Bonobo"):     ["rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain",
+                                "panTro5ToPanTro4.over.chain", "panTro4ToPanPan2.over.chain"],
+    ("Macaque", "Gorilla"):    ["rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain",
+                                "panTro5ToGorGor5.over.chain", "gorGor5ToGorGor4.over.chain"],
+    ("Macaque", "Marmoset"):   ["rheMac10ToCalJac4.over.chain", "calJac4ToCalJac1.over.chain"],
+
+    # --- Marmoset (calJac1) -> others ---
+    ("Marmoset", "Macaque"):   ["calJac1ToCalJac4.over.chain", "calJac4ToRheMac10.over.chain"],
+    ("Marmoset", "Chimpanzee"):["calJac1ToCalJac4.over.chain", "calJac4ToRheMac10.over.chain",
+                                "rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain"],
+    ("Marmoset", "Bonobo"):    ["calJac1ToCalJac4.over.chain", "calJac4ToRheMac10.over.chain",
+                                "rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain",
+                                "panTro5ToPanTro4.over.chain", "panTro4ToPanPan2.over.chain"],
+    ("Marmoset", "Gorilla"):   ["calJac1ToCalJac4.over.chain", "calJac4ToRheMac10.over.chain",
+                                "rheMac10ToPanTro6.over.chain", "panTro6ToPanTro5.over.chain",
+                                "panTro5ToGorGor5.over.chain", "gorGor5ToGorGor4.over.chain"],
+}
+
+
+def _multi_step_liftover(
+    input_bed: str,
+    output_bed: str,
+    chain_files: List[str],
+    liftover_path: str,
+    min_match: float = 0.5,
+) -> Dict[str, Any]:
+    """
+    Chain multiple sequential liftOver calls.
+
+    Each step's output becomes the next step's input.
+    Returns the final lifted count and a per-step summary.
+    """
+    n_input = sum(1 for line in open(input_bed) if line.strip() and not line.startswith("#"))
+    current_bed = input_bed
+    step_summary = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, chain in enumerate(chain_files):
+            is_last = (i == len(chain_files) - 1)
+            step_out = output_bed if is_last else os.path.join(tmpdir, f"step_{i}.bed")
+            step_unmapped = os.path.join(tmpdir, f"step_{i}.unmapped.bed")
+
+            result = liftover_peaks(
+                input_bed=current_bed,
+                output_bed=step_out,
+                chain_file=chain,
+                liftover_path=liftover_path,
+                min_match=min_match,
+                auto_chr=True,
+                verbose=False,
+                ncpu=1,
+            )
+
+            lifted = result.get("lifted", 0)
+            step_summary.append({
+                "step": i + 1,
+                "chain": os.path.basename(chain),
+                "input": sum(1 for line in open(current_bed) if line.strip() and not line.startswith("#")) if os.path.exists(current_bed) else 0,
+                "lifted": lifted,
+            })
+
+            if lifted == 0:
+                # Nothing left to lift; ensure output exists
+                if not is_last:
+                    Path(output_bed).touch()
+                break
+
+            current_bed = step_out
+
+    n_output = sum(1 for line in open(output_bed) if line.strip() and not line.startswith("#")) if os.path.exists(output_bed) else 0
+    return {
+        "status": "success",
+        "input": n_input,
+        "lifted": n_output,
+        "steps": step_summary,
+    }
+
+
+def cross_map_species_specific_peaks(
+    species_specific_beds: Dict[str, str],
+    species_beds: Dict[str, str],
+    chain_dir: str,
+    liftover_path: str,
+    output_dir: str,
+    min_match: Union[float, Dict[str, float]] = 0.5,
+    verbose: bool = True,
+    ncpu: int = 1,
+) -> pd.DataFrame:
+    """
+    Map each species' specific peaks to every other species via direct
+    inter-species chain files (multi-step, avoiding hg38).
+
+    Species-specific peaks are those that failed the hg38 round-trip,
+    so routing them through hg38 again is unlikely to succeed. Instead,
+    we use direct assembly-to-assembly chains (e.g. panPan2 -> gorGor5 ->
+    gorGor4) downloaded from UCSC.
+
+    The routes are defined in CROSS_SPECIES_ROUTES. Each route is a list
+    of chain files applied sequentially. Great apes are closely related
+    and typically need only 2 hops. Distant pairs (e.g. Gorilla->Marmoset)
+    require more hops via intermediate assemblies.
+
+    For each pair (source, target):
+      1. Apply the multi-step liftover route
+      2. Intersect the result with the target's original consensus peaks
+
+    Args:
+        species_specific_beds: Dict of species -> path to species-specific peaks
+        species_beds: Dict of species -> path to original consensus peaks
+        chain_dir: Chain file directory
+        liftover_path: liftOver binary path
+        output_dir: Where to write cross-map outputs
+        min_match: Min match for liftover (float or per-species dict)
+        verbose: Print progress
+        ncpu: Unused (kept for API compatibility)
+
+    Returns:
+        DataFrame with cross-mapping summary.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    def _get_mm(species: str) -> float:
+        if isinstance(min_match, dict):
+            return min_match.get(species, 0.5)
+        return min_match
+
+    all_species = sorted(species_specific_beds.keys())
+    results_rows = []
+
+    if verbose:
+        print("=" * 70)
+        print("CROSS-MAPPING SPECIES-SPECIFIC PEAKS (DIRECT INTER-SPECIES CHAINS)")
+        print("=" * 70)
+        print("Strategy: direct multi-step liftover between assemblies")
+        print("          (avoiding hg38, since these peaks failed the hg38 round-trip)")
+        print()
+
+    for source in all_species:
+        src_bed = species_specific_beds[source]
+        if not os.path.exists(src_bed):
+            continue
+
+        n_source = sum(1 for line in open(src_bed) if line.strip() and not line.startswith("#"))
+        if n_source == 0:
+            continue
+
+        if verbose:
+            print(f"\n{source} ({n_source:,} specific peaks):")
+
+        for target in all_species:
+            if target == source:
+                continue
+
+            route_key = (source, target)
+            if route_key not in CROSS_SPECIES_ROUTES:
+                if verbose:
+                    print(f"  -> {target}: no route available, skipping")
+                results_rows.append({
+                    "source": source,
+                    "target": target,
+                    "source_specific": n_source,
+                    "n_hops": 0,
+                    "route": "none",
+                    "lifted_to_target": 0,
+                    "overlap_target_peaks": 0,
+                    "pct_overlap": 0.0,
+                })
+                continue
+
+            chain_basenames = CROSS_SPECIES_ROUTES[route_key]
+            chain_paths = [os.path.join(chain_dir, c) for c in chain_basenames]
+
+            # Check all chain files exist
+            missing = [c for c in chain_paths if not os.path.exists(c)]
+            if missing:
+                if verbose:
+                    print(f"  -> {target}: MISSING chain files: {[os.path.basename(m) for m in missing]}")
+                results_rows.append({
+                    "source": source,
+                    "target": target,
+                    "source_specific": n_source,
+                    "n_hops": len(chain_basenames),
+                    "route": " -> ".join(chain_basenames),
+                    "lifted_to_target": 0,
+                    "overlap_target_peaks": 0,
+                    "pct_overlap": 0.0,
+                })
+                continue
+
+            target_orig = species_beds.get(target, "")
+            if not os.path.exists(target_orig):
+                continue
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Multi-step liftover
+                lifted_bed = os.path.join(tmpdir, f"lifted_to_{target}.bed")
+                lift_result = _multi_step_liftover(
+                    input_bed=src_bed,
+                    output_bed=lifted_bed,
+                    chain_files=chain_paths,
+                    liftover_path=liftover_path,
+                    min_match=_get_mm(source),
+                )
+
+                n_lifted = lift_result.get("lifted", 0)
+                if n_lifted == 0:
+                    if verbose:
+                        print(f"  -> {target} ({len(chain_basenames)} hops): 0 peaks lifted")
+                    results_rows.append({
+                        "source": source,
+                        "target": target,
+                        "source_specific": n_source,
+                        "n_hops": len(chain_basenames),
+                        "route": " -> ".join(chain_basenames),
+                        "lifted_to_target": 0,
+                        "overlap_target_peaks": 0,
+                        "pct_overlap": 0.0,
+                    })
+                    continue
+
+                # Harmonize chr prefix between lifted and target
+                def _first_chr(path):
+                    with open(path) as fh:
+                        for ln in fh:
+                            if ln.strip():
+                                return ln.split("\t")[0]
+                    return ""
+
+                lifted_chr = _first_chr(lifted_bed)
+                target_chr = _first_chr(target_orig)
+
+                target_use = target_orig
+                if lifted_chr.startswith("chr") != target_chr.startswith("chr"):
+                    target_fixed = os.path.join(tmpdir, f"target_{target}_fixed.bed")
+                    with open(target_orig) as fin, open(target_fixed, "w") as fout:
+                        for line in fin:
+                            if line.strip() and not line.startswith("#"):
+                                if lifted_chr.startswith("chr") and not line.startswith("chr"):
+                                    fout.write("chr" + line)
+                                elif not lifted_chr.startswith("chr") and line.startswith("chr"):
+                                    fout.write(line[3:])
+                                else:
+                                    fout.write(line)
+                    target_use = target_fixed
+
+                # Sort and intersect
+                lifted_sorted = os.path.join(tmpdir, "lifted_sorted.bed")
+                target_sorted = os.path.join(tmpdir, "target_sorted.bed")
+                subprocess.run(f"sort -k1,1 -k2,2n {lifted_bed} > {lifted_sorted}", shell=True, check=True)
+                subprocess.run(f"sort -k1,1 -k2,2n {target_use} > {target_sorted}", shell=True, check=True)
+
+                overlap_out = os.path.join(tmpdir, "overlap.bed")
+                subprocess.run(
+                    f"bedtools intersect -a {lifted_sorted} -b {target_sorted} -u > {overlap_out}",
+                    shell=True, check=True,
+                )
+                n_overlap = sum(1 for _ in open(overlap_out))
+
+                pct = n_overlap / n_source * 100 if n_source > 0 else 0
+
+                # Format step summary
+                steps_str = ""
+                if verbose:
+                    for s in lift_result.get("steps", []):
+                        steps_str += f"\n      step {s['step']}: {s['chain']}  {s['input']}->{s['lifted']}"
+
+                results_rows.append({
+                    "source": source,
+                    "target": target,
+                    "source_specific": n_source,
+                    "n_hops": len(chain_basenames),
+                    "route": " -> ".join(chain_basenames),
+                    "lifted_to_target": n_lifted,
+                    "overlap_target_peaks": n_overlap,
+                    "pct_overlap": pct,
+                })
+
+                if verbose:
+                    print(f"  -> {target} ({len(chain_basenames)} hops): "
+                          f"{n_lifted:,} lifted, {n_overlap:,} overlap ({pct:.1f}%)"
+                          f"{steps_str}")
+
+    # Build summary DataFrame
+    cross_df = pd.DataFrame(results_rows)
+
+    # Save
+    out_file = os.path.join(output_dir, "species_specific_cross_mapping.tsv")
+    cross_df.to_csv(out_file, sep="\t", index=False)
+
+    # Also create a summary matrix
+    if len(cross_df) > 0:
+        matrix = cross_df.pivot_table(
+            index="source", columns="target",
+            values="pct_overlap", fill_value=0,
+        )
+        matrix_file = os.path.join(output_dir, "cross_mapping_matrix_pct.tsv")
+        matrix.to_csv(matrix_file, sep="\t")
+
+        overlap_matrix = cross_df.pivot_table(
+            index="source", columns="target",
+            values="overlap_target_peaks", fill_value=0,
+        )
+        overlap_file = os.path.join(output_dir, "cross_mapping_matrix_counts.tsv")
+        overlap_matrix.to_csv(overlap_file, sep="\t")
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"CROSS-MAPPING SUMMARY (% of source-specific peaks overlapping target)")
+            print(f"{'='*70}")
+            print(matrix.round(1).to_string())
+            print(f"\nSaved: {out_file}")
+            print(f"Saved: {matrix_file}")
+            print(f"Saved: {overlap_file}")
+
+    return cross_df
+
+
+# =============================================================================
 # LEGACY: merge_bed_files (kept for backwards compatibility)
 # =============================================================================
 
@@ -898,12 +1607,13 @@ def cross_species_consensus_pipeline(
     output_dir: str,
     chain_dir: str = DEFAULT_CHAIN_DIR,
     liftover_path: str = "liftOver",
-    min_match: float = 0.95,
+    min_match: Union[float, Dict[str, float]] = 0.95,
     min_blocks: Optional[float] = None,
     multiple: bool = False,
     merge_distance: int = 0,
     peak_prefix: str = "unified",
     gtf_files: Optional[Dict[str, str]] = None,
+    pre_lifted_beds: Optional[Dict[str, str]] = None,
     verbose: bool = True,
     ncpu: int = 1,
 ) -> Dict[str, Any]:
@@ -911,7 +1621,7 @@ def cross_species_consensus_pipeline(
     Complete cross-species peak comparison pipeline with species tracking.
 
     Steps:
-    1. Liftover all non-human species peaks to hg38
+    1. Liftover all non-human species peaks to hg38 (or load pre-lifted)
     2. Merge lifted peaks + human peaks, tracking species of origin
     3. Identify human-specific peaks (human peaks not overlapping any non-human)
     4. Add peak IDs for tracking
@@ -925,12 +1635,17 @@ def cross_species_consensus_pipeline(
         output_dir: Output directory for all results
         chain_dir: Directory containing chain files
         liftover_path: Path to liftOver executable
-        min_match: Minimum match ratio for liftover
+        min_match: Minimum match ratio for liftover. Either a single float
+            applied to all species, or a dict mapping species name to its
+            match ratio (e.g. {'Bonobo': 0.9, 'Macaque': 0.8}).
         min_blocks: Minimum ratio of alignment blocks that must map
         multiple: Allow multiple output regions
         merge_distance: Distance for merging peaks
         peak_prefix: Prefix for unified peak IDs
         gtf_files: Dict mapping species name to GTF file path (optional)
+        pre_lifted_beds: Optional dict mapping species name to path of
+            pre-computed liftover BED files (already in hg38 coords).
+            If provided, Step 1 is skipped for those species.
         verbose: Print detailed progress
         ncpu: Number of parallel workers
 
@@ -968,22 +1683,48 @@ def cross_species_consensus_pipeline(
     print("=" * 70)
 
     # =========================================================================
-    # STEP 1: Liftover all non-human species to hg38
+    # STEP 1: Liftover all non-human species to hg38 (or load pre-lifted)
     # =========================================================================
     print("\nSTEP 1: Liftover non-human species -> hg38")
     print("-" * 50)
 
     lifted_beds = {}  # species -> lifted BED path
 
+    # Helper: resolve per-species min_match
+    def _get_min_match(species: str) -> float:
+        if isinstance(min_match, dict):
+            return min_match.get(species, 0.95)
+        return min_match
+
     for species, input_bed in species_beds.items():
+        # Check if pre-lifted file was provided
+        if pre_lifted_beds and species in pre_lifted_beds:
+            pre_lifted = pre_lifted_beds[species]
+            if os.path.exists(pre_lifted):
+                print(f"   {species}: using pre-lifted file ({pre_lifted})")
+                lifted_beds[species] = pre_lifted
+                n_lifted = sum(1 for _ in open(pre_lifted))
+                n_original = sum(1 for l in open(input_bed) if l.strip() and not l.startswith('#'))
+                results["lift_to_human"][species] = {
+                    "status": "success",
+                    "original": n_original,
+                    "lifted": n_lifted,
+                    "unmapped": n_original - n_lifted,
+                    "source": "pre_lifted",
+                }
+                continue
+            else:
+                print(f"   {species}: pre-lifted file not found, running liftover")
+
         if not os.path.exists(input_bed):
             print(f"   Skipping {species} - file not found: {input_bed}")
             continue
 
         output_bed = os.path.join(lift_human_dir, f"{species}_hg38.bed")
+        species_mm = _get_min_match(species)
 
         if verbose:
-            print(f"\n   {species}:")
+            print(f"\n   {species} (min_match={species_mm}):")
 
         if species == "Marmoset":
             chain1 = get_chain_file("Marmoset_step1", chain_dir)
@@ -991,7 +1732,7 @@ def cross_species_consensus_pipeline(
             result = liftover_two_step(
                 input_bed=input_bed, output_bed=output_bed,
                 chain_file_1=chain1, chain_file_2=chain2,
-                liftover_path=liftover_path, min_match=min_match,
+                liftover_path=liftover_path, min_match=species_mm,
                 min_blocks=min_blocks, multiple=multiple,
                 auto_chr=True, verbose=verbose, ncpu=ncpu,
             )
@@ -1000,7 +1741,7 @@ def cross_species_consensus_pipeline(
             result = liftover_peaks(
                 input_bed=input_bed, output_bed=output_bed,
                 chain_file=chain_file, liftover_path=liftover_path,
-                min_match=min_match, min_blocks=min_blocks,
+                min_match=species_mm, min_blocks=min_blocks,
                 multiple=multiple, auto_chr=True, verbose=verbose, ncpu=ncpu,
             )
 
@@ -1096,7 +1837,7 @@ def cross_species_consensus_pipeline(
             species=species,
             chain_dir=chain_dir,
             liftover_path=liftover_path,
-            min_match=min_match,
+            min_match=_get_min_match(species),
             min_blocks=min_blocks,
             multiple=multiple,
             auto_chr=True,
@@ -1153,6 +1894,52 @@ def cross_species_consensus_pipeline(
     )
     results["annotation"] = annotation_result
     results["output_files"]["annotation"] = os.path.join(annotation_dir, "peak_annotation.tsv")
+
+    # =========================================================================
+    # STEP 7: Master annotation table
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 7: Building master annotation table")
+    print("-" * 50)
+
+    master_dir = os.path.join(output_dir, "07_master_annotation")
+    os.makedirs(master_dir, exist_ok=True)
+    master_file = os.path.join(master_dir, "master_annotation.tsv")
+
+    master_df = build_master_annotation(
+        unified_bed=merged_with_ids,
+        human_specific_bed=human_specific_bed,
+        species_specific_beds=species_specific_beds,
+        liftback_dir=lift_back_dir,
+        gene_bed_dir=os.path.join(annotation_dir, "gene_beds"),
+        human_gene_annotation_tsv=os.path.join(annotation_dir, "unified_gene_annotation.tsv"),
+        species_list=list(species_beds.keys()),
+        output_file=master_file,
+        verbose=verbose,
+    )
+    results["master_annotation"] = master_df
+    results["output_files"]["master_annotation"] = master_file
+
+    # =========================================================================
+    # STEP 8: Cross-map species-specific peaks
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 8: Cross-mapping species-specific peaks (direct inter-species chains)")
+    print("-" * 50)
+
+    cross_map_dir = os.path.join(output_dir, "08_cross_mapping")
+    cross_map_df = cross_map_species_specific_peaks(
+        species_specific_beds=species_specific_beds,
+        species_beds=species_beds,
+        chain_dir=chain_dir,
+        liftover_path=liftover_path,
+        output_dir=cross_map_dir,
+        min_match=min_match,
+        verbose=verbose,
+        ncpu=ncpu,
+    )
+    results["cross_mapping"] = cross_map_df
+    results["output_files"]["cross_mapping"] = os.path.join(cross_map_dir, "species_specific_cross_mapping.tsv")
 
     # =========================================================================
     # SUMMARY

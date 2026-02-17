@@ -72,8 +72,11 @@ from .cross_species import (
     add_peak_ids,
     liftback_peaks,
     create_peak_matrix,
+    build_master_annotation,
+    cross_map_species_specific_peaks,
     get_reverse_chain_file,
     REVERSE_CHAIN_FILES,
+    CROSS_SPECIES_ROUTES,
 )
 
 from .quantification import (
@@ -113,6 +116,8 @@ __all__ = [
     "add_peak_ids",
     "liftback_peaks",
     "create_peak_matrix",
+    "build_master_annotation",
+    "cross_map_species_specific_peaks",
     "get_reverse_chain_file",
     "REVERSE_CHAIN_FILES",
     # Quantification
