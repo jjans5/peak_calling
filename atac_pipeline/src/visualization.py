@@ -524,3 +524,177 @@ def plot_peak_counts_report(
     
     print(f"Total peaks: {total_peaks:,}")
     print(f"Mean per cell type: {mean_peaks:,.0f}")
+
+
+# =============================================================================
+# UPSET PLOT  (pure matplotlib -- no upsetplot library)
+# =============================================================================
+
+def plot_upset(
+    df: pd.DataFrame,
+    set_columns: List[str],
+    *,
+    set_labels: Optional[List[str]] = None,
+    top_n: int = 30,
+    color: str = "steelblue",
+    inactive_color: str = "#e0e0e0",
+    title: Optional[str] = None,
+    figsize: Optional[tuple] = None,
+    show_counts: bool = True,
+    count_fontsize: float = 7,
+    count_rotation: float = 90,
+    label_fontsize: float = 10,
+    dot_size: float = 60,
+    line_width: float = 2,
+    bar_width: float = 0.7,
+    saveas: Optional[str] = None,
+    dpi: int = 150,
+    show: bool = True,
+) -> plt.Figure:
+    """Create an UpSet plot showing intersection sizes for set-membership data.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame where each ``set_columns`` column is boolean / 0-1,
+        indicating membership of that row in the corresponding set.
+    set_columns : list of str
+        Column names in *df* that represent set membership (bool or 0/1).
+    set_labels : list of str, optional
+        Display labels for the sets.  Defaults to *set_columns*.
+    top_n : int
+        Number of largest intersections to show (default 30).
+    color : str
+        Colour for bars and active dots (any matplotlib colour spec).
+    inactive_color : str
+        Colour for inactive (background) dots.
+    title : str, optional
+        Figure title.
+    figsize : tuple, optional
+        ``(width, height)`` in inches.  Auto-calculated when *None*.
+    show_counts : bool
+        Label each bar with its count.
+    count_fontsize : float
+        Font size for count labels on bars.
+    count_rotation : float
+        Rotation angle (degrees) for count labels.
+    label_fontsize : float
+        Font size for set labels on the y-axis of the dot matrix.
+    dot_size : float
+        Marker size for dots in the intersection matrix.
+    line_width : float
+        Width of vertical connector lines between active dots.
+    bar_width : float
+        Width of intersection-size bars (0–1).
+    saveas : str, optional
+        Path to save the figure.  If *None*, figure is not saved to disk.
+    dpi : int
+        Resolution for saved figure.
+    show : bool
+        Whether to call ``plt.show()``.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if set_labels is None:
+        set_labels = list(set_columns)
+    n_sets = len(set_columns)
+
+    # --- build intersection counts ---
+    mem = df[set_columns].astype(int)
+    pattern = mem.apply(tuple, axis=1)
+    combo_counts = pattern.value_counts().sort_values(ascending=False)
+
+    combos = combo_counts.head(top_n)
+    n_combos = len(combos)
+
+    membership = np.array([list(c) for c in combos.index])   # (n_combos, n_sets)
+    sizes = combos.values                                      # (n_combos,)
+    set_sizes = mem.sum().values                               # (n_sets,)
+
+    # --- figure layout ---
+    if figsize is None:
+        figsize = (max(14, n_combos * 0.55), 8)
+    fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(
+        2, 2,
+        width_ratios=[n_combos, max(4, n_combos * 0.2)],
+        height_ratios=[2.5, n_sets * 0.45],
+        hspace=0.05, wspace=0.12,
+    )
+    ax_bar = fig.add_subplot(gs[0, 0])
+    ax_mat = fig.add_subplot(gs[1, 0])
+    ax_set = fig.add_subplot(gs[1, 1])
+    ax_empty = fig.add_subplot(gs[0, 1])
+    ax_empty.axis("off")
+
+    x = np.arange(n_combos)
+
+    # --- intersection-size bars ---
+    ax_bar.bar(x, sizes, color=color, edgecolor="white", width=bar_width)
+    if show_counts:
+        for i, v in enumerate(sizes):
+            ax_bar.text(
+                i, v + max(sizes) * 0.01, f"{v:,}",
+                ha="center", va="bottom",
+                fontsize=count_fontsize, rotation=count_rotation,
+            )
+    ax_bar.set_ylabel("Intersection size")
+    ax_bar.set_xlim(-0.6, n_combos - 0.4)
+    ax_bar.set_xticks([])
+    ax_bar.spines[["top", "right", "bottom"]].set_visible(False)
+    if title:
+        ax_bar.set_title(title, fontsize=13, pad=12)
+
+    # --- dot matrix ---
+    for j in range(n_sets):
+        ax_mat.scatter(
+            x, np.full(n_combos, j), s=dot_size,
+            color=inactive_color, zorder=1, edgecolors="none",
+        )
+    for i in range(n_combos):
+        active = np.where(membership[i] == 1)[0]
+        if len(active) > 0:
+            ax_mat.scatter(
+                np.full(len(active), i), active, s=dot_size,
+                color=color, zorder=2, edgecolors="none",
+            )
+            if len(active) > 1:
+                ax_mat.plot(
+                    [i, i], [active.min(), active.max()],
+                    color=color, lw=line_width, zorder=1,
+                )
+
+    ax_mat.set_yticks(range(n_sets))
+    ax_mat.set_yticklabels(set_labels, fontsize=label_fontsize)
+    ax_mat.set_xlim(-0.6, n_combos - 0.4)
+    ax_mat.set_ylim(-0.5, n_sets - 0.5)
+    ax_mat.invert_yaxis()
+    ax_mat.set_xticks([])
+    ax_mat.spines[["top", "right", "bottom"]].set_visible(False)
+    ax_mat.tick_params(left=False)
+
+    # --- set-size bars ---
+    y = np.arange(n_sets)
+    ax_set.barh(y, set_sizes, color=color, edgecolor="white", height=0.6)
+    for j, v in enumerate(set_sizes):
+        ax_set.text(
+            v + max(set_sizes) * 0.02, j, f"{v:,.0f}",
+            va="center", fontsize=label_fontsize - 1,
+        )
+    ax_set.set_yticks([])
+    ax_set.set_ylim(-0.5, n_sets - 0.5)
+    ax_set.invert_yaxis()
+    ax_set.set_xlabel("Set size", fontsize=label_fontsize)
+    ax_set.spines[["top", "right", "left"]].set_visible(False)
+
+    plt.tight_layout()
+
+    if saveas:
+        fig.savefig(saveas, dpi=dpi, bbox_inches="tight")
+        print(f"Saved UpSet plot: {saveas}")
+    if show:
+        plt.show()
+
+    return fig

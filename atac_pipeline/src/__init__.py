@@ -44,6 +44,7 @@ from .visualization import (
     plot_genome_regions,
     plot_peak_distribution,
     plot_consensus_summary,
+    plot_upset,
 )
 
 from .bigwig import (

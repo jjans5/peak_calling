@@ -1315,6 +1315,105 @@ def _multi_step_liftover(
     }
 
 
+def _cross_map_one_pair(
+    source: str,
+    target: str,
+    src_bed: str,
+    n_source: int,
+    chain_paths: List[str],
+    chain_basenames: List[str],
+    target_orig: str,
+    liftover_path: str,
+    min_match_val: float,
+) -> Dict[str, Any]:
+    """
+    Cross-map one (source, target) pair: multi-step liftover + intersection.
+
+    Designed to be called in parallel via ProcessPoolExecutor.
+    All paths are resolved before submission so no closures are needed.
+
+    Returns a dict with the cross-mapping result row.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lifted_bed = os.path.join(tmpdir, f"lifted_to_{target}.bed")
+        lift_result = _multi_step_liftover(
+            input_bed=src_bed,
+            output_bed=lifted_bed,
+            chain_files=chain_paths,
+            liftover_path=liftover_path,
+            min_match=min_match_val,
+        )
+
+        n_lifted = lift_result.get("lifted", 0)
+        step_summary = lift_result.get("steps", [])
+
+        if n_lifted == 0:
+            return {
+                "source": source,
+                "target": target,
+                "source_specific": n_source,
+                "n_hops": len(chain_basenames),
+                "route": " -> ".join(chain_basenames),
+                "lifted_to_target": 0,
+                "overlap_target_peaks": 0,
+                "pct_overlap": 0.0,
+                "steps": step_summary,
+            }
+
+        # Harmonize chr prefix between lifted and target
+        def _first_chr(path):
+            with open(path) as fh:
+                for ln in fh:
+                    if ln.strip():
+                        return ln.split("\t")[0]
+            return ""
+
+        lifted_chr = _first_chr(lifted_bed)
+        target_chr = _first_chr(target_orig)
+
+        target_use = target_orig
+        if lifted_chr.startswith("chr") != target_chr.startswith("chr"):
+            target_fixed = os.path.join(tmpdir, f"target_{target}_fixed.bed")
+            with open(target_orig) as fin, open(target_fixed, "w") as fout:
+                for line in fin:
+                    if line.strip() and not line.startswith("#"):
+                        if lifted_chr.startswith("chr") and not line.startswith("chr"):
+                            fout.write("chr" + line)
+                        elif not lifted_chr.startswith("chr") and line.startswith("chr"):
+                            fout.write(line[3:])
+                        else:
+                            fout.write(line)
+            target_use = target_fixed
+
+        # Sort and intersect
+        lifted_sorted = os.path.join(tmpdir, "lifted_sorted.bed")
+        target_sorted = os.path.join(tmpdir, "target_sorted.bed")
+        subprocess.run(f"sort -k1,1 -k2,2n {lifted_bed} > {lifted_sorted}",
+                       shell=True, check=True, capture_output=True)
+        subprocess.run(f"sort -k1,1 -k2,2n {target_use} > {target_sorted}",
+                       shell=True, check=True, capture_output=True)
+
+        overlap_out = os.path.join(tmpdir, "overlap.bed")
+        subprocess.run(
+            f"bedtools intersect -a {lifted_sorted} -b {target_sorted} -u > {overlap_out}",
+            shell=True, check=True, capture_output=True,
+        )
+        n_overlap = sum(1 for _ in open(overlap_out))
+        pct = n_overlap / n_source * 100 if n_source > 0 else 0
+
+        return {
+            "source": source,
+            "target": target,
+            "source_specific": n_source,
+            "n_hops": len(chain_basenames),
+            "route": " -> ".join(chain_basenames),
+            "lifted_to_target": n_lifted,
+            "overlap_target_peaks": n_overlap,
+            "pct_overlap": pct,
+            "steps": step_summary,
+        }
+
+
 def cross_map_species_specific_peaks(
     species_specific_beds: Dict[str, str],
     species_beds: Dict[str, str],
@@ -1351,11 +1450,14 @@ def cross_map_species_specific_peaks(
         output_dir: Where to write cross-map outputs
         min_match: Min match for liftover (float or per-species dict)
         verbose: Print progress
-        ncpu: Unused (kept for API compatibility)
+        ncpu: Number of parallel workers (default 1 = sequential).
+              Each source-target pair is processed independently.
 
     Returns:
         DataFrame with cross-mapping summary.
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     os.makedirs(output_dir, exist_ok=True)
 
     def _get_mm(species: str) -> float:
@@ -1364,7 +1466,6 @@ def cross_map_species_specific_peaks(
         return min_match
 
     all_species = sorted(species_specific_beds.keys())
-    results_rows = []
 
     if verbose:
         print("=" * 70)
@@ -1372,19 +1473,23 @@ def cross_map_species_specific_peaks(
         print("=" * 70)
         print("Strategy: direct multi-step liftover between assemblies")
         print("          (avoiding hg38, since these peaks failed the hg38 round-trip)")
+        if ncpu > 1:
+            print(f"⚙️  Using {ncpu} parallel workers")
         print()
 
+    # ----- Build list of jobs -----
+    jobs = []       # (source, target, src_bed, n_source, chain_paths, chain_basenames, target_orig, mm)
+    skip_rows = []  # results for pairs we can skip immediately
+
+    source_counts = {}
     for source in all_species:
         src_bed = species_specific_beds[source]
         if not os.path.exists(src_bed):
             continue
-
         n_source = sum(1 for line in open(src_bed) if line.strip() and not line.startswith("#"))
         if n_source == 0:
             continue
-
-        if verbose:
-            print(f"\n{source} ({n_source:,} specific peaks):")
+        source_counts[source] = n_source
 
         for target in all_species:
             if target == source:
@@ -1392,36 +1497,28 @@ def cross_map_species_specific_peaks(
 
             route_key = (source, target)
             if route_key not in CROSS_SPECIES_ROUTES:
-                if verbose:
-                    print(f"  -> {target}: no route available, skipping")
-                results_rows.append({
-                    "source": source,
-                    "target": target,
-                    "source_specific": n_source,
-                    "n_hops": 0,
-                    "route": "none",
-                    "lifted_to_target": 0,
-                    "overlap_target_peaks": 0,
-                    "pct_overlap": 0.0,
+                skip_rows.append({
+                    "source": source, "target": target,
+                    "source_specific": n_source, "n_hops": 0,
+                    "route": "none", "lifted_to_target": 0,
+                    "overlap_target_peaks": 0, "pct_overlap": 0.0,
                 })
                 continue
 
             chain_basenames = CROSS_SPECIES_ROUTES[route_key]
             chain_paths = [os.path.join(chain_dir, c) for c in chain_basenames]
 
-            # Check all chain files exist
             missing = [c for c in chain_paths if not os.path.exists(c)]
             if missing:
                 if verbose:
-                    print(f"  -> {target}: MISSING chain files: {[os.path.basename(m) for m in missing]}")
-                results_rows.append({
-                    "source": source,
-                    "target": target,
+                    print(f"  {source} -> {target}: MISSING chain files: "
+                          f"{[os.path.basename(m) for m in missing]}")
+                skip_rows.append({
+                    "source": source, "target": target,
                     "source_specific": n_source,
                     "n_hops": len(chain_basenames),
                     "route": " -> ".join(chain_basenames),
-                    "lifted_to_target": 0,
-                    "overlap_target_peaks": 0,
+                    "lifted_to_target": 0, "overlap_target_peaks": 0,
                     "pct_overlap": 0.0,
                 })
                 continue
@@ -1430,96 +1527,92 @@ def cross_map_species_specific_peaks(
             if not os.path.exists(target_orig):
                 continue
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # Multi-step liftover
-                lifted_bed = os.path.join(tmpdir, f"lifted_to_{target}.bed")
-                lift_result = _multi_step_liftover(
-                    input_bed=src_bed,
-                    output_bed=lifted_bed,
-                    chain_files=chain_paths,
-                    liftover_path=liftover_path,
-                    min_match=_get_mm(source),
-                )
+            jobs.append((
+                source, target, src_bed, n_source,
+                chain_paths, chain_basenames, target_orig, _get_mm(source),
+            ))
 
-                n_lifted = lift_result.get("lifted", 0)
-                if n_lifted == 0:
+    if verbose:
+        print(f"  {len(jobs)} liftover jobs to run, {len(skip_rows)} skipped")
+
+    # ----- Execute jobs (parallel or sequential) -----
+    results_rows = list(skip_rows)
+
+    if ncpu > 1 and len(jobs) > 1:
+        n_workers = min(ncpu, len(jobs))
+        if verbose:
+            print(f"  🚀 Submitting {len(jobs)} jobs to {n_workers} workers...")
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
+            for src, tgt, src_bed, n_src, c_paths, c_names, tgt_orig, mm in jobs:
+                fut = executor.submit(
+                    _cross_map_one_pair,
+                    src, tgt, src_bed, n_src,
+                    c_paths, c_names, tgt_orig,
+                    liftover_path, mm,
+                )
+                futures[fut] = (src, tgt)
+
+            for fut in as_completed(futures):
+                source, target = futures[fut]
+                try:
+                    result = fut.result()
+                    results_rows.append(result)
                     if verbose:
-                        print(f"  -> {target} ({len(chain_basenames)} hops): 0 peaks lifted")
+                        n_src = result["source_specific"]
+                        n_hop = result["n_hops"]
+                        n_lft = result["lifted_to_target"]
+                        n_ovl = result["overlap_target_peaks"]
+                        pct = result["pct_overlap"]
+                        steps_str = ""
+                        for s in result.get("steps", []):
+                            steps_str += (f"\n      step {s['step']}: "
+                                          f"{s['chain']}  {s['input']}->{s['lifted']}")
+                        print(f"  {source} -> {target} ({n_hop} hops): "
+                              f"{n_lft:,} lifted, {n_ovl:,} overlap ({pct:.1f}%)"
+                              f"{steps_str}")
+                except Exception as exc:
+                    print(f"  {source} -> {target}: ERROR: {exc}")
                     results_rows.append({
-                        "source": source,
-                        "target": target,
-                        "source_specific": n_source,
-                        "n_hops": len(chain_basenames),
-                        "route": " -> ".join(chain_basenames),
-                        "lifted_to_target": 0,
-                        "overlap_target_peaks": 0,
+                        "source": source, "target": target,
+                        "source_specific": source_counts.get(source, 0),
+                        "n_hops": 0, "route": "error",
+                        "lifted_to_target": 0, "overlap_target_peaks": 0,
                         "pct_overlap": 0.0,
                     })
-                    continue
+    else:
+        # Sequential execution
+        for src, tgt, src_bed_, n_src_, c_paths_, c_names_, tgt_orig_, mm_ in jobs:
+            source, target = src, tgt
+            if verbose:
+                print(f"  {source} -> {target} ...", end="", flush=True)
 
-                # Harmonize chr prefix between lifted and target
-                def _first_chr(path):
-                    with open(path) as fh:
-                        for ln in fh:
-                            if ln.strip():
-                                return ln.split("\t")[0]
-                    return ""
+            result = _cross_map_one_pair(
+                src, tgt, src_bed_, n_src_,
+                c_paths_, c_names_, tgt_orig_,
+                liftover_path, mm_,
+            )
+            results_rows.append(result)
 
-                lifted_chr = _first_chr(lifted_bed)
-                target_chr = _first_chr(target_orig)
-
-                target_use = target_orig
-                if lifted_chr.startswith("chr") != target_chr.startswith("chr"):
-                    target_fixed = os.path.join(tmpdir, f"target_{target}_fixed.bed")
-                    with open(target_orig) as fin, open(target_fixed, "w") as fout:
-                        for line in fin:
-                            if line.strip() and not line.startswith("#"):
-                                if lifted_chr.startswith("chr") and not line.startswith("chr"):
-                                    fout.write("chr" + line)
-                                elif not lifted_chr.startswith("chr") and line.startswith("chr"):
-                                    fout.write(line[3:])
-                                else:
-                                    fout.write(line)
-                    target_use = target_fixed
-
-                # Sort and intersect
-                lifted_sorted = os.path.join(tmpdir, "lifted_sorted.bed")
-                target_sorted = os.path.join(tmpdir, "target_sorted.bed")
-                subprocess.run(f"sort -k1,1 -k2,2n {lifted_bed} > {lifted_sorted}", shell=True, check=True)
-                subprocess.run(f"sort -k1,1 -k2,2n {target_use} > {target_sorted}", shell=True, check=True)
-
-                overlap_out = os.path.join(tmpdir, "overlap.bed")
-                subprocess.run(
-                    f"bedtools intersect -a {lifted_sorted} -b {target_sorted} -u > {overlap_out}",
-                    shell=True, check=True,
-                )
-                n_overlap = sum(1 for _ in open(overlap_out))
-
-                pct = n_overlap / n_source * 100 if n_source > 0 else 0
-
-                # Format step summary
+            if verbose:
+                n_hop = result["n_hops"]
+                n_lft = result["lifted_to_target"]
+                n_ovl = result["overlap_target_peaks"]
+                pct = result["pct_overlap"]
                 steps_str = ""
-                if verbose:
-                    for s in lift_result.get("steps", []):
-                        steps_str += f"\n      step {s['step']}: {s['chain']}  {s['input']}->{s['lifted']}"
+                for s in result.get("steps", []):
+                    steps_str += (f"\n      step {s['step']}: "
+                                  f"{s['chain']}  {s['input']}->{s['lifted']}")
+                print(f" ({n_hop} hops): "
+                      f"{n_lft:,} lifted, {n_ovl:,} overlap ({pct:.1f}%)"
+                      f"{steps_str}")
 
-                results_rows.append({
-                    "source": source,
-                    "target": target,
-                    "source_specific": n_source,
-                    "n_hops": len(chain_basenames),
-                    "route": " -> ".join(chain_basenames),
-                    "lifted_to_target": n_lifted,
-                    "overlap_target_peaks": n_overlap,
-                    "pct_overlap": pct,
-                })
+    # ----- Build summary -----
+    # Remove internal 'steps' key before making DataFrame
+    for row in results_rows:
+        row.pop("steps", None)
 
-                if verbose:
-                    print(f"  -> {target} ({len(chain_basenames)} hops): "
-                          f"{n_lifted:,} lifted, {n_overlap:,} overlap ({pct:.1f}%)"
-                          f"{steps_str}")
-
-    # Build summary DataFrame
     cross_df = pd.DataFrame(results_rows)
 
     # Save
