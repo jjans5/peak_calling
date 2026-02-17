@@ -120,6 +120,7 @@ __all__ = [
     "cross_map_species_specific_peaks",
     "get_reverse_chain_file",
     "REVERSE_CHAIN_FILES",
+    "CROSS_SPECIES_ROUTES",
     # Quantification
     "quantify",
     "quantify_matrix",

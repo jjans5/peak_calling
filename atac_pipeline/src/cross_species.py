@@ -37,13 +37,17 @@ REVERSE_CHAIN_FILES = {
 }
 
 # Default GTF files for closest-gene annotation
+# NOTE: Cellranger reference directories are named using Ensembl conventions
+# (panPan1 = panpan1.1, panTro3 = Pan_tro_3.0) but the underlying assemblies
+# are the same as UCSC panPan2 and panTro5 respectively (confirmed via NCBI
+# accessions GCA_000258655.2 and GCA_000001515.5). No coordinate mismatch.
 DEFAULT_GTF_FILES = {
     "Human": "/cluster/home/jjanssens/jjans/analysis/cerebellum/genomes_new/homo_sapiens/gencode.v48.basic.annotation.gtf.gz",
-    "Bonobo": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/panPan1/genes/genes.gtf",
+    "Bonobo": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/panPan1/genes/genes.gtf",       # Ensembl panpan1.1 = UCSC panPan2
     "Gorilla": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/gorGor4/genes/genes.gtf",
     "Macaque": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/Mmul10/genes/genes.gtf",
     "Marmoset": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/calJac1_mito/genes/genes.gtf",
-    "Chimpanzee": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/panTro3/genes/genes.gtf.gz",
+    "Chimpanzee": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/panTro3/genes/genes.gtf.gz", # Ensembl Pan_tro_3.0 = UCSC panTro5
 }
 
 

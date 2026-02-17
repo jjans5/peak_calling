@@ -1,0 +1,136 @@
+{
+    "description": "Assembly naming mapping between Ensembl, UCSC, and NCBI conventions for cross-species ATAC-seq pipeline",
+    "note": "Cellranger reference directory names follow Ensembl conventions. Chain files use UCSC naming. Despite different naming, the underlying coordinate systems are consistent.",
+    "species": {
+        "Human": {
+            "ensembl_name": "GRCh38",
+            "ucsc_name": "hg38",
+            "ncbi_accession": "GCA_000001405.28",
+            "cellranger_dir": "GRCh38",
+            "chromosome_naming": "chr1, chr2, ..., chrX, chrY, chrM",
+            "chain_files": {
+                "to_hg38": null,
+                "route": "direct (reference species)"
+            },
+            "notes": "Reference species for cross-species liftover"
+        },
+        "Bonobo": {
+            "ensembl_name": "panpan1.1",
+            "ucsc_name": "panPan2",
+            "ncbi_accession": "GCA_000258655.2",
+            "cellranger_dir": "panPan1",
+            "chromosome_naming": "1, 2, ..., X, Y (no 'chr' prefix)",
+            "chr1_size": 227611842,
+            "chain_files": {
+                "to_hg38": "panPan2ToHg38.over.chain",
+                "route": "direct"
+            },
+            "notes": "Ensembl panpan1.1 is the same assembly as UCSC panPan2 (NCBI synonym). Cellranger dir 'panPan1' uses Ensembl convention."
+        },
+        "Chimpanzee": {
+            "ensembl_name": "Pan_tro_3.0",
+            "ucsc_name": "panTro5",
+            "ncbi_accession": "GCA_000001515.5",
+            "cellranger_dir": "panTro3",
+            "chromosome_naming": "1, 2A, 2B, ..., X, Y (no 'chr' prefix)",
+            "chr1_size": 228573443,
+            "chain_files": {
+                "to_hg38": "panTro5ToHg38.over.chain",
+                "route": "direct"
+            },
+            "notes": "Ensembl Pan_tro_3.0 is the same assembly as UCSC panTro5 (NCBI synonym). Cellranger dir 'panTro3' uses Ensembl convention."
+        },
+        "Gorilla": {
+            "ensembl_name": "gorGor4",
+            "ucsc_name": "gorGor4",
+            "ncbi_accession": "GCA_000151905.2",
+            "cellranger_dir": "gorGor4",
+            "chromosome_naming": "1, 2a, 2b, ..., X (no 'chr' prefix)",
+            "chr1_size": 227203817,
+            "chain_files": {
+                "to_hg38": "gorGor4ToHg38.over.chain",
+                "route": "direct"
+            },
+            "notes": "Same name in both Ensembl and UCSC conventions."
+        },
+        "Macaque": {
+            "ensembl_name": "Mmul_10",
+            "ucsc_name": "rheMac10",
+            "ncbi_accession": "GCA_003339765.3",
+            "cellranger_dir": "Mmul10",
+            "chromosome_naming": "1, 2, ..., X, Y (no 'chr' prefix)",
+            "chr1_size": 225584828,
+            "chain_files": {
+                "to_hg38": "rheMac10ToHg38.over.chain",
+                "route": "direct"
+            },
+            "notes": "Ensembl Mmul_10 is the same assembly as UCSC rheMac10."
+        },
+        "Marmoset": {
+            "ensembl_name": "mCalJac1.pat.X",
+            "ucsc_name": "NOT a standard UCSC assembly (see notes)",
+            "ncbi_accession": "GCA_011100555.1",
+            "cellranger_dir": "calJac1_mito",
+            "chromosome_naming": "1, 2, ..., X, Y, NC_025586.1 (no 'chr' prefix)",
+            "chr1_size": 216975769,
+            "mitochondrial_contig": {
+                "name": "NC_025586.1",
+                "size": 16499,
+                "notes": "Named by NCBI accession, not MT or chrM. Listed as non_nuclear_contigs in cellranger reference.json."
+            },
+            "chain_files": {
+                "step1": "calJac1ToCalJac4.over.chain",
+                "step2": "calJac4ToHg38.over.chain",
+                "route": "two-step: mCalJac1.pat.X -> calJac4 (cj1700_1.1) -> hg38"
+            },
+            "notes": "Complex naming situation. The cellranger dir 'calJac1_mito' contains Ensembl's mCalJac1.pat.X (VGP assembly, GCA_011100555.1, 2020). This is NOT the old UCSC calJac1 (= Callithrix_jacchus-2.0.2, 2007 Sanger draft) nor calJac3 (= Callithrix_jacchus-3.2, GCA_000004665.1). The chain file 'calJac1ToCalJac4' is custom-generated and uses mCalJac1.pat.X coordinates as source (chr1=216,975,769), lifting to UCSC calJac4 (= Callithrix_jacchus_cj1700_1.1, GCA_009663435.2, chr1=217,961,735). Both are VGP-era assemblies from different individuals/methods.",
+            "assembly_comparison": {
+                "ucsc_calJac1": {
+                    "assembly": "Callithrix_jacchus-2.0.2",
+                    "year": 2007,
+                    "type": "Sanger draft, contigs only (no chromosomes)",
+                    "ncbi_accession": "unknown (pre-chromosome era)",
+                    "notes": "Very old draft with only contigs (Contig0, Contig1, ...). NOT used in this pipeline."
+                },
+                "ucsc_calJac3": {
+                    "assembly": "Callithrix_jacchus-3.2",
+                    "year": 2010,
+                    "type": "Chromosome-level, Sanger",
+                    "ncbi_accession": "GCA_000004665.1",
+                    "chr1_size": 210400635,
+                    "notes": "The standard pre-VGP marmoset reference. NOT used in this pipeline."
+                },
+                "ucsc_calJac4": {
+                    "assembly": "Callithrix_jacchus_cj1700_1.1",
+                    "year": 2020,
+                    "type": "Chromosome-level, VGP (PacBio+Illumina+HiC+Bionano)",
+                    "ncbi_accession": "GCA_009663435.2",
+                    "chr1_size": 217961735,
+                    "notes": "VGP assembly from cj1700 individual. Used as intermediate in two-step liftover to hg38."
+                },
+                "ensembl_mCalJac1": {
+                    "assembly": "mCalJac1.pat.X",
+                    "year": 2020,
+                    "type": "Chromosome-level, VGP (PacBio+Illumina+HiC+Bionano)",
+                    "ncbi_accession": "GCA_011100555.1",
+                    "chr1_size": 216975769,
+                    "notes": "Current Ensembl reference for marmoset. Used in cellranger for scATAC-seq. Different VGP assembly from calJac4."
+                }
+            }
+        }
+    },
+    "chain_file_directory": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files/",
+    "reference_directory": "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/reference_/",
+    "liftover_routes": {
+        "Bonobo_to_Human": ["panPan2ToHg38.over.chain"],
+        "Chimpanzee_to_Human": ["panTro5ToHg38.over.chain"],
+        "Gorilla_to_Human": ["gorGor4ToHg38.over.chain"],
+        "Macaque_to_Human": ["rheMac10ToHg38.over.chain"],
+        "Marmoset_to_Human": ["calJac1ToCalJac4.over.chain", "calJac4ToHg38.over.chain"],
+        "Human_to_Bonobo": ["hg38ToPanPan2.over.chain"],
+        "Human_to_Chimpanzee": ["hg38ToPanTro5.over.chain"],
+        "Human_to_Gorilla": ["hg38ToGorGor4.over.chain"],
+        "Human_to_Macaque": ["hg38ToRheMac10.over.chain"],
+        "Human_to_Marmoset": ["hg38ToCalJac4.over.chain", "calJac4ToCalJac1.over.chain"]
+    }
+}
