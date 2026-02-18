@@ -618,6 +618,287 @@ def liftover_two_step(
         }
 
 
+def compute_liftover_similarity(
+    input_bed: str,
+    chain_forward: str,
+    chain_reverse: str,
+    liftover_path: str = "liftOver",
+    chain_forward_2: Optional[str] = None,
+    chain_reverse_2: Optional[str] = None,
+    auto_chr: bool = True,
+    verbose: bool = True,
+    ncpu: int = 1,
+) -> pd.DataFrame:
+    """
+    Compute per-peak base-level similarity between source and target assemblies.
+
+    For each input peak, performs a round-trip liftover
+    (source → target → source) with min_match=0 to accept ALL mappable bases,
+    then measures the fraction of original bases recovered in the round-trip.
+
+    This gives a continuous 0–1 score per peak (analogous to `min_match`, but
+    as an *output* metric rather than a filter threshold).
+
+    For two-step species (e.g. Marmoset: calJac1→calJac4→hg38), provide the
+    intermediate chain files via ``chain_forward_2`` / ``chain_reverse_2``.
+
+    Parameters
+    ----------
+    input_bed : str
+        Input BED file (source-genome coordinates, ≥3 columns).
+    chain_forward : str
+        Chain file source → target (or source → intermediate for two-step).
+    chain_reverse : str
+        Chain file target → source (or intermediate → source for two-step).
+    liftover_path : str
+        Path to UCSC ``liftOver`` executable.
+    chain_forward_2 : str, optional
+        Second chain for two-step forward lift (intermediate → target).
+    chain_reverse_2 : str, optional
+        Second chain for two-step reverse lift (target → intermediate).
+    auto_chr : bool
+        Automatically fix chr-prefix mismatches.
+    verbose : bool
+        Print progress messages.
+    ncpu : int
+        Number of parallel liftOver workers.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per input peak with columns:
+
+        - ``chrom``, ``start``, ``end`` – original coordinates
+        - ``peak_id`` – from 4th column of input, if present
+        - ``original_size`` – size of the original peak (bp)
+        - ``lifted_size`` – size after forward lift (0 if unmapped)
+        - ``roundtrip_overlap`` – bp overlap of round-trip with original
+        - ``match_ratio`` – ``roundtrip_overlap / original_size`` (0–1)
+        - ``size_ratio`` – ``lifted_size / original_size``
+        - ``status`` – ``'mapped'``, ``'unmapped_forward'``, or
+          ``'unmapped_reverse'``
+    """
+    if verbose:
+        print("🔬 Computing per-peak liftover similarity (round-trip method)...")
+
+    # Read input peaks
+    input_peaks = []
+    with open(input_bed) as f:
+        for line in f:
+            if line.strip() and not line.startswith('#'):
+                parts = line.strip().split('\t')
+                chrom, start, end = parts[0], int(parts[1]), int(parts[2])
+                peak_id = parts[3] if len(parts) > 3 else f"peak_{len(input_peaks)+1:06d}"
+                input_peaks.append({
+                    'chrom': chrom, 'start': start, 'end': end,
+                    'peak_id': peak_id, 'original_size': end - start,
+                })
+    n_input = len(input_peaks)
+    if verbose:
+        print(f"   Input: {n_input:,} peaks")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # -----------------------------------------------------------------
+        # STEP 1: Forward lift (source → target) with min_match=0
+        # -----------------------------------------------------------------
+        fwd_input = os.path.join(tmpdir, "fwd_input.bed")
+        fwd_output = os.path.join(tmpdir, "fwd_output.bed")
+
+        # Write BED4 (using peak_id for tracking)
+        with open(fwd_input, 'w') as f:
+            for p in input_peaks:
+                f.write(f"{p['chrom']}\t{p['start']}\t{p['end']}\t{p['peak_id']}\n")
+
+        two_step_forward = chain_forward_2 is not None
+        if two_step_forward:
+            fwd_result = liftover_two_step(
+                input_bed=fwd_input, output_bed=fwd_output,
+                chain_file_1=chain_forward, chain_file_2=chain_forward_2,
+                liftover_path=liftover_path, min_match=0.0,
+                auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+            )
+        else:
+            fwd_result = liftover_peaks(
+                input_bed=fwd_input, output_bed=fwd_output,
+                chain_file=chain_forward, liftover_path=liftover_path,
+                min_match=0.0, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+            )
+
+        if verbose:
+            print(f"   Forward lift: {fwd_result.get('lifted', 0):,} / {n_input:,} mapped")
+
+        # Parse forward-lifted peaks: the output has source coords appended
+        # Format: target_chr  target_start  target_end  peak_id  source_coord
+        fwd_lifted = {}  # peak_id -> (target_chr, target_start, target_end)
+        if os.path.exists(fwd_output):
+            with open(fwd_output) as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    pid = parts[3]
+                    fwd_lifted[pid] = (parts[0], int(parts[1]), int(parts[2]))
+
+        # -----------------------------------------------------------------
+        # STEP 2: Reverse lift (target → source) with min_match=0
+        # -----------------------------------------------------------------
+        rev_input = os.path.join(tmpdir, "rev_input.bed")
+        rev_output = os.path.join(tmpdir, "rev_output.bed")
+
+        # Write forward-lifted peaks as input for reverse lift
+        with open(rev_input, 'w') as f:
+            for pid, (c, s, e) in fwd_lifted.items():
+                f.write(f"{c}\t{s}\t{e}\t{pid}\n")
+
+        two_step_reverse = chain_reverse_2 is not None
+        if two_step_reverse:
+            rev_result = liftover_two_step(
+                input_bed=rev_input, output_bed=rev_output,
+                chain_file_1=chain_reverse, chain_file_2=chain_reverse_2,
+                liftover_path=liftover_path, min_match=0.0,
+                auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+            )
+        else:
+            rev_result = liftover_peaks(
+                input_bed=rev_input, output_bed=rev_output,
+                chain_file=chain_reverse, liftover_path=liftover_path,
+                min_match=0.0, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+            )
+
+        if verbose:
+            n_fwd = len(fwd_lifted)
+            print(f"   Reverse lift: {rev_result.get('lifted', 0):,} / {n_fwd:,} mapped back")
+
+        # Parse round-tripped peaks
+        # Format: source_chr  source_start  source_end  peak_id  <possible extra>  target_coord
+        rev_lifted = {}  # peak_id -> (source_chr, source_start, source_end)
+        if os.path.exists(rev_output):
+            with open(rev_output) as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    pid = parts[3]
+                    rev_lifted[pid] = (parts[0], int(parts[1]), int(parts[2]))
+
+        # -----------------------------------------------------------------
+        # STEP 3: Compute overlap between original and round-tripped
+        # -----------------------------------------------------------------
+        # Write original and round-tripped as sorted BED for bedtools
+        orig_bed4 = os.path.join(tmpdir, "orig_sorted.bed")
+        rt_bed4 = os.path.join(tmpdir, "rt_sorted.bed")
+        intersect_out = os.path.join(tmpdir, "intersect.bed")
+
+        with open(orig_bed4, 'w') as f:
+            for p in input_peaks:
+                f.write(f"{p['chrom']}\t{p['start']}\t{p['end']}\t{p['peak_id']}\n")
+
+        with open(rt_bed4, 'w') as f:
+            for pid, (c, s, e) in rev_lifted.items():
+                f.write(f"{c}\t{s}\t{e}\t{pid}\n")
+
+        # Sort both
+        orig_sorted = os.path.join(tmpdir, "orig_s.bed")
+        rt_sorted = os.path.join(tmpdir, "rt_s.bed")
+        subprocess.run(f"sort -k1,1 -k2,2n {orig_bed4} > {orig_sorted}",
+                        shell=True, check=True)
+        subprocess.run(f"sort -k1,1 -k2,2n {rt_bed4} > {rt_sorted}",
+                        shell=True, check=True)
+
+        # Detect chr prefix mismatch and fix
+        def _first_chr(path):
+            with open(path) as fh:
+                for line in fh:
+                    if line.strip():
+                        return line.split('\t')[0].startswith('chr')
+            return True
+
+        if os.path.getsize(rt_sorted) > 0 and os.path.getsize(orig_sorted) > 0:
+            orig_has_chr = _first_chr(orig_sorted)
+            rt_has_chr = _first_chr(rt_sorted)
+            if orig_has_chr != rt_has_chr:
+                fixed = os.path.join(tmpdir, "rt_fixed.bed")
+                with open(rt_sorted) as fin, open(fixed, 'w') as fout:
+                    for line in fin:
+                        if orig_has_chr and not line.startswith('chr'):
+                            fout.write('chr' + line)
+                        elif not orig_has_chr and line.startswith('chr'):
+                            fout.write(line[3:])
+                        else:
+                            fout.write(line)
+                rt_sorted = fixed
+                subprocess.run(f"sort -k1,1 -k2,2n {rt_sorted} > {rt_sorted}.s && mv {rt_sorted}.s {rt_sorted}",
+                                shell=True, check=True)
+
+        # Use bedtools intersect -wao to get overlap per peak pair (by name match)
+        # Strategy: intersect on coordinates, then filter by matching peak_id
+        overlap_map = {}  # peak_id -> overlap_bases
+        if os.path.getsize(rt_sorted) > 0:
+            subprocess.run(
+                f"bedtools intersect -a {orig_sorted} -b {rt_sorted} -wao > {intersect_out}",
+                shell=True, check=True
+            )
+            with open(intersect_out) as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    orig_pid = parts[3]
+                    if len(parts) >= 9:
+                        rt_pid = parts[7]
+                        overlap = int(parts[8])
+                        if orig_pid == rt_pid:
+                            overlap_map[orig_pid] = overlap_map.get(orig_pid, 0) + overlap
+
+        # -----------------------------------------------------------------
+        # STEP 4: Build results DataFrame
+        # -----------------------------------------------------------------
+        records = []
+        for p in input_peaks:
+            pid = p['peak_id']
+            orig_size = p['original_size']
+
+            if pid in fwd_lifted:
+                fc, fs, fe = fwd_lifted[pid]
+                lifted_size = fe - fs
+                if pid in rev_lifted:
+                    overlap = overlap_map.get(pid, 0)
+                    match_ratio = overlap / orig_size if orig_size > 0 else 0.0
+                    status = 'mapped'
+                else:
+                    overlap = 0
+                    match_ratio = 0.0
+                    status = 'unmapped_reverse'
+            else:
+                lifted_size = 0
+                overlap = 0
+                match_ratio = 0.0
+                status = 'unmapped_forward'
+
+            records.append({
+                'chrom': p['chrom'],
+                'start': p['start'],
+                'end': p['end'],
+                'peak_id': pid,
+                'original_size': orig_size,
+                'lifted_size': lifted_size,
+                'roundtrip_overlap': overlap,
+                'match_ratio': round(match_ratio, 4),
+                'size_ratio': round(lifted_size / orig_size, 4) if orig_size > 0 else 0.0,
+                'status': status,
+            })
+
+        df = pd.DataFrame(records)
+
+        if verbose:
+            mapped = df[df['status'] == 'mapped']
+            print(f"\n   📊 Similarity summary:")
+            print(f"      Total peaks:        {len(df):,}")
+            print(f"      Mapped (round-trip): {len(mapped):,} ({len(mapped)/len(df)*100:.1f}%)")
+            if len(mapped) > 0:
+                print(f"      Match ratio (median): {mapped['match_ratio'].median():.3f}")
+                print(f"      Match ratio (mean):   {mapped['match_ratio'].mean():.3f}")
+                print(f"      Match ratio ≥0.95:    {(mapped['match_ratio'] >= 0.95).sum():,}")
+                print(f"      Match ratio ≥0.50:    {(mapped['match_ratio'] >= 0.50).sum():,}")
+                print(f"      Match ratio <0.50:    {(mapped['match_ratio'] < 0.50).sum():,}")
+
+        return df
+
+
 def liftover_narrowpeak(
     input_narrowpeak: str,
     output_narrowpeak: str,

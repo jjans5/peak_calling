@@ -34,6 +34,7 @@ from .liftover import (
     liftover_peaks,
     liftover_two_step,
     liftover_fragments_parallel,
+    compute_liftover_similarity,
     print_chain_info,
     get_chain_file,
     CHAIN_FILES,

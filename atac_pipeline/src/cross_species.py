@@ -24,7 +24,7 @@ from collections import defaultdict
 
 import pandas as pd
 
-from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR
+from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR, compute_liftover_similarity
 
 # Reverse chain files (hg38 -> species)
 REVERSE_CHAIN_FILES = {
@@ -56,6 +56,98 @@ def get_reverse_chain_file(species: str, chain_dir: str = DEFAULT_CHAIN_DIR) -> 
     if species not in REVERSE_CHAIN_FILES:
         raise ValueError(f"Unknown species: {species}. Available: {list(REVERSE_CHAIN_FILES.keys())}")
     return os.path.join(chain_dir, REVERSE_CHAIN_FILES[species])
+
+
+def compute_species_similarity(
+    input_bed: str,
+    species_list: Optional[List[str]] = None,
+    chain_dir: str = DEFAULT_CHAIN_DIR,
+    liftover_path: str = "liftOver",
+    output_tsv: Optional[str] = None,
+    verbose: bool = True,
+    ncpu: int = 1,
+) -> pd.DataFrame:
+    """
+    Compute per-peak liftover similarity for multiple species.
+
+    For each species, performs a round-trip liftover
+    (hg38 → species → hg38) and measures how many bases survive.
+    Returns a combined DataFrame with a ``species`` column.
+
+    Parameters
+    ----------
+    input_bed : str
+        BED file in hg38 coordinates (e.g. unified consensus).
+    species_list : list of str, optional
+        Species to compute similarity for.
+        Default: ``["Bonobo", "Chimpanzee", "Gorilla", "Macaque", "Marmoset"]``
+    chain_dir : str
+        Directory containing chain files.
+    liftover_path : str
+        Path to UCSC ``liftOver`` executable.
+    output_tsv : str, optional
+        If provided, save combined results to this TSV file.
+    verbose : bool
+        Print progress.
+    ncpu : int
+        Workers for parallel liftover.
+
+    Returns
+    -------
+    pd.DataFrame
+        Combined DataFrame with columns from ``compute_liftover_similarity``
+        plus a ``species`` column.
+    """
+    if species_list is None:
+        species_list = ["Bonobo", "Chimpanzee", "Gorilla", "Macaque", "Marmoset"]
+
+    all_dfs = []
+    for species in species_list:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  {species}")
+            print(f"{'='*60}")
+
+        # Resolve chain files
+        if species == "Marmoset":
+            chain_fwd = get_chain_file("Marmoset_step1", chain_dir)
+            chain_fwd_2 = get_chain_file("Marmoset_step2", chain_dir)
+            chain_rev = get_reverse_chain_file("Marmoset_step1", chain_dir)
+            chain_rev_2 = get_reverse_chain_file("Marmoset_step2", chain_dir)
+            # Forward: hg38 → calJac4 → calJac1  (reverse of species→hg38)
+            # So forward = reverse chains, reverse = forward chains
+            df = compute_liftover_similarity(
+                input_bed=input_bed,
+                chain_forward=chain_rev,      # hg38 → calJac4
+                chain_reverse=chain_fwd,      # calJac4 → hg38
+                chain_forward_2=chain_rev_2,  # calJac4 → calJac1
+                chain_reverse_2=chain_fwd_2,  # calJac1 → calJac4
+                liftover_path=liftover_path,
+                auto_chr=True, verbose=verbose, ncpu=ncpu,
+            )
+        else:
+            chain_rev = get_reverse_chain_file(species, chain_dir)
+            chain_fwd = get_chain_file(species, chain_dir)
+            df = compute_liftover_similarity(
+                input_bed=input_bed,
+                chain_forward=chain_rev,   # hg38 → species
+                chain_reverse=chain_fwd,   # species → hg38
+                liftover_path=liftover_path,
+                auto_chr=True, verbose=verbose, ncpu=ncpu,
+            )
+
+        df['species'] = species
+        all_dfs.append(df)
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    if output_tsv:
+        os.makedirs(os.path.dirname(output_tsv) or '.', exist_ok=True)
+        combined.to_csv(output_tsv, sep='\t', index=False)
+        if verbose:
+            print(f"\n💾 Saved combined similarity to: {output_tsv}")
+
+    return combined
 
 
 # =============================================================================
