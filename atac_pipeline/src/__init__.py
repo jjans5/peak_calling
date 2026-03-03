@@ -77,6 +77,8 @@ from .cross_species import (
     build_master_annotation,
     cross_map_species_specific_peaks,
     get_reverse_chain_file,
+    summit_based_merge,
+    liftover_summits_with_conservation,
     REVERSE_CHAIN_FILES,
     CROSS_SPECIES_ROUTES,
 )
@@ -84,6 +86,9 @@ from .cross_species import (
 from .quantification import (
     quantify,
     quantify_matrix,
+    quantify_bigwig,
+    quantify_bigwig_matrix,
+    fragments_to_bigwigs,
     save_matrix,
     load_matrix,
 )
@@ -121,11 +126,16 @@ __all__ = [
     "build_master_annotation",
     "cross_map_species_specific_peaks",
     "get_reverse_chain_file",
+    "summit_based_merge",
+    "liftover_summits_with_conservation",
     "REVERSE_CHAIN_FILES",
     "CROSS_SPECIES_ROUTES",
     # Quantification
     "quantify",
     "quantify_matrix",
+    "quantify_bigwig",
+    "quantify_bigwig_matrix",
+    "fragments_to_bigwigs",
     "save_matrix",
     "load_matrix",
     # BigWig

@@ -285,6 +285,478 @@ def _python_merge_with_tracking(input_bed: str, output_bed: str, merge_distance:
 
 
 # =============================================================================
+# SUMMIT-BASED CONSENSUS MERGING (v2)
+# =============================================================================
+
+def _normalize_scores_by_species(
+    summits: List[Dict[str, Any]],
+    verbose: bool = False,
+) -> None:
+    """
+    Normalize peak scores within each species to [0, 1] using percentile rank.
+
+    This ensures species with different sequencing depths or cell numbers
+    contribute comparable weights to the score-weighted consensus.
+    Modifies summits in-place by adding a 'norm_score' key.
+
+    Args:
+        summits: List of summit dicts, each with 'species' and 'score' keys
+        verbose: Print per-species score ranges
+    """
+    by_species = defaultdict(list)
+    for s in summits:
+        by_species[s['species']].append(s)
+
+    for species, peaks in by_species.items():
+        scores = [p['score'] for p in peaks]
+        n = len(scores)
+
+        if n <= 1:
+            for p in peaks:
+                p['norm_score'] = 1.0
+            continue
+
+        # Rank-based normalization: ties get average rank
+        sorted_indices = sorted(range(n), key=lambda i: scores[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            # Find ties
+            j = i
+            while j < n and scores[sorted_indices[j]] == scores[sorted_indices[i]]:
+                j += 1
+            avg_rank = (i + j - 1) / 2.0
+            for k in range(i, j):
+                ranks[sorted_indices[k]] = avg_rank
+            i = j
+
+        # Scale to [0, 1]
+        max_rank = n - 1
+        for idx, p in enumerate(peaks):
+            p['norm_score'] = ranks[idx] / max_rank if max_rank > 0 else 0.5
+
+        if verbose:
+            raw = [p['score'] for p in peaks]
+            norm = [p['norm_score'] for p in peaks]
+            print(f"      {species}: raw [{min(raw):.0f}, {max(raw):.0f}] "
+                  f"-> norm [{min(norm):.3f}, {max(norm):.3f}]")
+
+
+def summit_based_merge(
+    species_beds: Dict[str, str],
+    output_bed: str,
+    summit_window: int = 500,
+    cluster_distance: int = 250,
+    max_peak_size: int = 2000,
+    min_peak_size: int = 100,
+    score_col: int = 4,
+    normalize_scores: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Summit-based cross-species consensus peak merging.
+
+    Instead of merging overlapping intervals (which creates enormous peaks
+    when lifted peaks from different species overlap due to structural
+    rearrangements), this approach:
+
+    1. Filters out peaks distorted by liftover (too large or too small)
+    2. Extracts 1bp summit (center) from each peak
+    3. Clusters nearby summits using ``bedtools cluster -d <distance>``
+    4. Computes score-weighted average position within each cluster
+    5. Expands to fixed-width windows (``summit_window`` bp)
+    6. Tracks species origin per consensus peak
+
+    Output BED format: chr, start, end, species_list (comma-separated)
+    (same as merge_with_species_tracking for downstream compatibility)
+
+    Args:
+        species_beds: Dict mapping species name to BED file path (hg38 coords).
+            Expects narrowPeak or at least BED5 format with a score column.
+        output_bed: Path to output merged BED file
+        summit_window: Width of output consensus peaks (default: 500bp)
+        cluster_distance: Max distance between summits to cluster (default: 250bp).
+            Two peaks whose centers are within this distance get merged.
+        max_peak_size: Maximum peak size to include (filters liftover artifacts)
+        min_peak_size: Minimum peak size to include
+        score_col: 0-indexed column number for peak scores (default: 4, BED score).
+            Use 6 for signalValue (fold enrichment) in narrowPeak format.
+        normalize_scores: Whether to normalize scores across species using
+            rank-based normalization (recommended when species have different
+            sequencing depths or cell counts)
+        verbose: Print progress
+
+    Returns:
+        Dictionary with merge statistics (compatible with existing pipeline)
+    """
+    if verbose:
+        print(f"Summit-based merge of {len(species_beds)} species")
+        print(f"   Parameters: window={summit_window}bp, cluster_d={cluster_distance}bp, "
+              f"size_filter=[{min_peak_size}, {max_peak_size}]bp")
+
+    os.makedirs(os.path.dirname(output_bed), exist_ok=True)
+
+    # ── Step 1: Read peaks, filter by size, extract summits ──────────────
+    summits = []
+    species_input = {}
+    species_filtered = {}
+
+    for species, bed_path in species_beds.items():
+        n_input = 0
+        n_size_filtered = 0
+
+        with open(bed_path) as f:
+            for line in f:
+                if not line.strip() or line.startswith('#'):
+                    continue
+                n_input += 1
+                parts = line.strip().split('\t')
+                chrom = parts[0]
+                start = int(parts[1])
+                end = int(parts[2])
+                peak_size = end - start
+
+                # Size filter: remove liftover-distorted peaks
+                if peak_size < min_peak_size or peak_size > max_peak_size:
+                    n_size_filtered += 1
+                    continue
+
+                # Extract score
+                score = float(parts[score_col]) if len(parts) > score_col else 1.0
+                if score <= 0:
+                    score = 1.0
+
+                # Summit = center of peak
+                summit_pos = (start + end) // 2
+
+                summits.append({
+                    'chrom': chrom,
+                    'summit': summit_pos,
+                    'score': score,
+                    'species': species,
+                })
+
+        species_input[species] = n_input
+        species_filtered[species] = n_size_filtered
+
+        if verbose:
+            kept = n_input - n_size_filtered
+            print(f"   {species}: {n_input:,} input, "
+                  f"{n_size_filtered:,} size-filtered, {kept:,} kept")
+
+    total_input = sum(species_input.values())
+    total_kept = len(summits)
+
+    if not summits:
+        with open(output_bed, 'w') as f:
+            pass
+        return {
+            "status": "error",
+            "message": "No summits after filtering",
+            "input_peaks": total_input,
+            "merged_peaks": 0,
+        }
+
+    if verbose:
+        print(f"   Total: {total_input:,} input -> {total_kept:,} summits after size filter")
+
+    # ── Step 2: Normalize scores ─────────────────────────────────────────
+    if normalize_scores:
+        _normalize_scores_by_species(summits, verbose=verbose)
+        if verbose:
+            print(f"   Scores normalized (rank-based) across {len(species_beds)} species")
+    else:
+        for s in summits:
+            s['norm_score'] = s['score']
+
+    # ── Step 3: Cluster summits with bedtools ────────────────────────────
+    with tempfile.TemporaryDirectory() as tmpdir:
+        summits_bed = os.path.join(tmpdir, "summits.bed")
+        sorted_bed = os.path.join(tmpdir, "summits_sorted.bed")
+        clustered_bed = os.path.join(tmpdir, "summits_clustered.bed")
+
+        # Write: chr, summit, summit+1, index, norm_score, species
+        with open(summits_bed, 'w') as f:
+            for i, s in enumerate(summits):
+                f.write(f"{s['chrom']}\t{s['summit']}\t{s['summit'] + 1}\t"
+                        f"{i}\t{s['norm_score']:.6f}\t{s['species']}\n")
+
+        # Sort
+        subprocess.run(
+            f"sort -k1,1 -k2,2n {summits_bed} > {sorted_bed}",
+            shell=True, check=True,
+        )
+
+        # Cluster: bedtools cluster adds a cluster ID as the last column
+        subprocess.run(
+            f"bedtools cluster -i {sorted_bed} -d {cluster_distance} > {clustered_bed}",
+            shell=True, check=True,
+        )
+
+        # ── Step 4: Parse clusters, compute weighted centers ─────────────
+        clusters = defaultdict(list)
+        with open(clustered_bed) as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                chrom = parts[0]
+                pos = int(parts[1])
+                score = float(parts[4])
+                species = parts[5]
+                cluster_id = parts[6]  # bedtools cluster appends this
+
+                clusters[(chrom, cluster_id)].append({
+                    'pos': pos,
+                    'score': score,
+                    'species': species,
+                })
+
+    # ── Step 5: Score-weighted center → fixed-width peaks ────────────────
+    half_window = summit_window // 2
+    consensus_peaks = []
+
+    for (chrom, _cid), members in clusters.items():
+        total_weight = sum(m['score'] for m in members)
+
+        if total_weight > 0:
+            center = int(
+                round(sum(m['pos'] * m['score'] for m in members) / total_weight)
+            )
+        else:
+            # Fallback: unweighted mean
+            center = int(round(sum(m['pos'] for m in members) / len(members)))
+
+        species_set = sorted(set(m['species'] for m in members))
+
+        start = max(0, center - half_window)
+        end = center + half_window
+
+        consensus_peaks.append((chrom, start, end, ','.join(species_set)))
+
+    # Sort by genomic position
+    consensus_peaks.sort(key=lambda x: (x[0], x[1]))
+
+    # ── Step 6: Write output ─────────────────────────────────────────────
+    with open(output_bed, 'w') as f:
+        for chrom, start, end, species_list in consensus_peaks:
+            f.write(f"{chrom}\t{start}\t{end}\t{species_list}\n")
+
+    # ── Statistics ───────────────────────────────────────────────────────
+    n_output = len(consensus_peaks)
+    sizes = [p[2] - p[1] for p in consensus_peaks] if consensus_peaks else [0]
+    species_dist = defaultdict(int)
+    for _, _, _, sp_list in consensus_peaks:
+        for sp in sp_list.split(','):
+            species_dist[sp.strip()] += 1
+
+    if verbose:
+        print(f"\n   Clustered {total_kept:,} summits into {n_output:,} consensus peaks")
+        print(f"   Output peak sizes: min={min(sizes)}, median={sorted(sizes)[len(sizes)//2]}, "
+              f"max={max(sizes)}")
+        reduction = (1 - n_output / total_input) * 100 if total_input > 0 else 0
+        print(f"   Reduction: {reduction:.1f}%")
+        print(f"   Species distribution in consensus peaks:")
+        for sp in sorted(species_dist.keys()):
+            print(f"      {sp}: present in {species_dist[sp]:,} peaks")
+
+    return {
+        "status": "success",
+        "input_peaks": total_input,
+        "merged_peaks": n_output,
+        "species_counts": dict(species_input),
+        "species_distribution": dict(species_dist),
+        "output_file": output_bed,
+        "summit_stats": {
+            "total_summits": total_kept,
+            "size_filtered": sum(species_filtered.values()),
+            "clusters": n_output,
+            "peak_size_range": (min(sizes), max(sizes)),
+        },
+    }
+
+
+# =============================================================================
+# SUMMIT-BASED LIFTOVER WITH CONSERVATION SCORING (v2)
+# =============================================================================
+
+def liftover_summits_with_conservation(
+    input_bed: str,
+    output_bed: str,
+    chain_file: str,
+    liftover_path: str = "liftOver",
+    min_match: float = 0.1,
+    summit_window: int = 500,
+    min_conservation: float = 0.0,
+    auto_chr: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Lift peaks by their 1bp summit, then re-expand to fixed-width windows.
+
+    This avoids the classic liftover distortion problem where a 500bp peak
+    in species A can map to a 50bp or 50,000bp region in species B due to
+    indels, inversions, or assembly gaps. Instead:
+
+    1. Extract 1bp summit (center) from each input peak
+    2. LiftOver the 1bp coordinate with a *relaxed* ``min_match`` (since
+       a single base either maps or doesn't — the stringent ``min_match``
+       is not meaningful for 1bp intervals)
+    3. Re-expand each lifted summit to a fixed ``summit_window`` bp window
+    4. Optionally compute a conservation score: liftover the full peak
+       interval and compute ``lifted_size / original_size``. Peaks below
+       ``min_conservation`` are discarded.
+
+    Use this as an alternative liftover strategy when you want all output
+    peaks to be a uniform size, regardless of structural variation.
+
+    Args:
+        input_bed: Input BED file (≥BED3; column 4 = name if present)
+        output_bed: Output BED file with fixed-width lifted peaks
+        chain_file: Path to liftOver chain file (source → target)
+        liftover_path: Path to liftOver binary
+        min_match: Min ratio for the full-interval liftover used to compute
+            conservation score. The summit liftover always uses 0.1.
+        summit_window: Width of output peaks (default: 500bp)
+        min_conservation: Minimum conservation score (lifted_size / original_size)
+            to keep a peak. Set to 0.0 to keep all successfully lifted summits.
+        auto_chr: Auto-detect and harmonize chr prefix
+        verbose: Print progress
+
+    Returns:
+        Dict with statistics: n_input, n_lifted, n_conservation_filtered, etc.
+    """
+    if verbose:
+        print(f"  Summit-based liftover (window={summit_window}bp, "
+              f"min_conservation={min_conservation})")
+
+    os.makedirs(os.path.dirname(output_bed), exist_ok=True)
+    half = summit_window // 2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # --- Step 1: Read input, extract summits ---
+        peaks = []  # list of (chrom, start, end, name)
+        summit_bed = os.path.join(tmpdir, "summits.bed")
+
+        with open(input_bed) as fin, open(summit_bed, 'w') as fout:
+            for i, line in enumerate(fin):
+                if not line.strip() or line.startswith('#'):
+                    continue
+                parts = line.strip().split('\t')
+                chrom = parts[0]
+                start = int(parts[1])
+                end = int(parts[2])
+                name = parts[3] if len(parts) > 3 else f"peak_{i}"
+                peaks.append((chrom, start, end, name))
+
+                # 1bp summit
+                center = (start + end) // 2
+                fout.write(f"{chrom}\t{center}\t{center + 1}\t{name}\n")
+
+        n_input = len(peaks)
+        if n_input == 0:
+            with open(output_bed, 'w') as f:
+                pass
+            return {"status": "success", "n_input": 0, "n_lifted": 0,
+                    "n_conservation_filtered": 0, "output_file": output_bed}
+
+        # --- Step 2: Liftover 1bp summits (relaxed minMatch) ---
+        summit_lifted = os.path.join(tmpdir, "summits_lifted.bed")
+        summit_unmapped = os.path.join(tmpdir, "summits_unmapped.bed")
+
+        cmd_summit = (
+            f"{liftover_path} {summit_bed} {chain_file} "
+            f"{summit_lifted} {summit_unmapped} -minMatch=0.1"
+        )
+        subprocess.run(cmd_summit, shell=True, check=True,
+                        capture_output=True, text=True)
+
+        # Parse lifted summits: name -> (target_chrom, target_pos)
+        lifted_summits = {}
+        with open(summit_lifted) as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 4:
+                    lifted_summits[parts[3]] = (parts[0], int(parts[1]))
+
+        n_summit_lifted = len(lifted_summits)
+
+        # --- Step 3: Optionally compute conservation score ---
+        conservation = {}  # name -> score
+        n_conservation_filtered = 0
+
+        if min_conservation > 0:
+            # Liftover full intervals to measure size distortion
+            full_bed = os.path.join(tmpdir, "full_intervals.bed")
+            full_lifted = os.path.join(tmpdir, "full_lifted.bed")
+            full_unmapped = os.path.join(tmpdir, "full_unmapped.bed")
+
+            with open(full_bed, 'w') as f:
+                for chrom, start, end, name in peaks:
+                    f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
+
+            cmd_full = (
+                f"{liftover_path} {full_bed} {chain_file} "
+                f"{full_lifted} {full_unmapped} -minMatch={min_match}"
+            )
+            subprocess.run(cmd_full, shell=True, check=True,
+                            capture_output=True, text=True)
+
+            # Build map: peak_name -> original_size
+            original_sizes = {name: end - start for chrom, start, end, name in peaks}
+
+            # Parse lifted full intervals
+            with open(full_lifted) as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 4:
+                        name = parts[3]
+                        lifted_size = int(parts[2]) - int(parts[1])
+                        orig_size = original_sizes.get(name, summit_window)
+                        # Conservation = how much of the interval survived
+                        conservation[name] = min(lifted_size / orig_size, 2.0) if orig_size > 0 else 0.0
+
+        # --- Step 4: Build output with fixed-width windows ---
+        results = []
+        for name, (target_chrom, target_pos) in lifted_summits.items():
+            # Conservation filter
+            if min_conservation > 0:
+                score = conservation.get(name, 0.0)
+                if score < min_conservation:
+                    n_conservation_filtered += 1
+                    continue
+
+            new_start = max(0, target_pos - half)
+            new_end = target_pos + half
+            results.append((target_chrom, new_start, new_end, name))
+
+        # Sort by genomic position
+        results.sort(key=lambda x: (x[0], x[1]))
+
+        with open(output_bed, 'w') as f:
+            for chrom, start, end, name in results:
+                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
+
+    n_output = len(results)
+    n_unmapped = n_input - n_summit_lifted
+
+    if verbose:
+        print(f"    Input: {n_input:,}")
+        print(f"    Summit lifted: {n_summit_lifted:,}, unmapped: {n_unmapped:,}")
+        if min_conservation > 0:
+            print(f"    Conservation filtered: {n_conservation_filtered:,}")
+        print(f"    Output: {n_output:,} peaks ({summit_window}bp each)")
+
+    return {
+        "status": "success",
+        "n_input": n_input,
+        "n_summit_lifted": n_summit_lifted,
+        "n_unmapped": n_unmapped,
+        "n_conservation_filtered": n_conservation_filtered,
+        "n_output": n_output,
+        "output_file": output_bed,
+    }
+
+
+# =============================================================================
 # HUMAN-SPECIFIC PEAK DETECTION
 # =============================================================================
 
@@ -298,8 +770,13 @@ def find_human_specific_peaks(
     """
     Find human peaks that do not overlap any non-human lifted peak.
 
-    These are peaks detected in the human genome that could not be
-    mapped from any other species (i.e., human-specific regulatory elements).
+    **Important**: These are peaks where no other species had a *called peak*
+    in the orthologous region — i.e., the regulatory element appears to be
+    active only in human. This does NOT mean the underlying sequence cannot
+    be lifted to other genomes (many of these regions will successfully
+    liftOver). For peaks whose *sequence* is unique to human (no orthologous
+    region in any other species), check liftback failure status in the
+    master annotation (``{Species}_orth == 0`` for all NHP species).
 
     Args:
         human_bed: Path to human consensus peaks (hg38)
@@ -1021,8 +1498,15 @@ def build_master_annotation(
       - {Species}_chr, {Species}_start, {Species}_end (liftback coords)
       - Human_gene, Human_gene_dist
       - {Species}_gene, {Species}_gene_dist (from bedtools closest on liftback)
-      - Human_det, Bonobo_det, ... (binary 0/1 from species_detected column)
-      - n_species (count of detected species)
+      - {Species}_det: binary 0/1 — a peak was *called* in that species
+        during the original peak-calling step AND overlapped this consensus
+        peak during the cross-species merge.
+      - {Species}_orth: binary 0/1 — the orthologous genomic region *exists*
+        in that species (liftback from hg38 succeeded). A peak can have
+        ``_orth=1`` but ``_det=0`` when the sequence is conserved but
+        the regulatory element is not active (no peak called).
+      - n_species_det: count of species with ``_det=1``
+      - n_species_orth: count of species with ``_orth=1``
 
     For species-specific peaks, only the native species coords are populated.
     """
@@ -1240,24 +1724,58 @@ def build_master_annotation(
                     all_rows.append(row)
 
     # ------------------------------------------------------------------
-    # 6. Build DataFrame and add binary detection columns
+    # 6. Build DataFrame and add detection + orthology columns
     # ------------------------------------------------------------------
     if verbose:
-        print("  6. Building DataFrame with binary detection columns...")
+        print("  6. Building DataFrame with detection + orthology columns...")
 
     all_species = ["Human"] + species_list
     df = pd.DataFrame(all_rows)
 
-    # Binary detection columns from species_detected
+    # --- Binary detection columns from species_detected ---
+    # These reflect which species had a CALLED PEAK overlapping this
+    # consensus peak during the cross-species merge step.
     for sp in all_species:
         col = f"{sp}_det"
         df[col] = df["species_detected"].str.contains(sp, na=False).astype(int)
 
-    df["n_species"] = df[[f"{sp}_det" for sp in all_species]].sum(axis=1)
+    df["n_species_det"] = df[[f"{sp}_det" for sp in all_species]].sum(axis=1)
+
+    # --- Binary orthology columns from liftback coordinates ---
+    # These reflect whether the orthologous region EXISTS in each species
+    # (i.e., the liftback from hg38 succeeded). A peak with _orth=1 but
+    # _det=0 means the genomic region is conserved but no peak was called
+    # there in that species (regulatory divergence).
+    # Human always has _orth=1 for unified/human_specific peaks (they are
+    # defined in hg38). For NHP species, _orth=1 iff liftback coords exist.
+    df["Human_orth"] = df["peak_type"].isin(
+        ["unified", "human_specific"]
+    ).astype(int)
+
+    for sp in species_list:
+        chr_col = f"{sp}_chr"
+        df[f"{sp}_orth"] = df[chr_col].notna().astype(int) if chr_col in df.columns else 0
+
+    orth_cols = [f"{sp}_orth" for sp in all_species]
+    df["n_species_orth"] = df[[c for c in orth_cols if c in df.columns]].sum(axis=1)
+
+    if verbose:
+        # Show the discrepancy between det and orth
+        for sp in all_species:
+            det_col = f"{sp}_det"
+            orth_col = f"{sp}_orth"
+            if det_col in df.columns and orth_col in df.columns:
+                n_det = df[det_col].sum()
+                n_orth = df[orth_col].sum()
+                n_orth_not_det = ((df[orth_col] == 1) & (df[det_col] == 0)).sum()
+                print(f"    {sp}: det={n_det:,}, orth={n_orth:,} "
+                      f"(orth but not det: {n_orth_not_det:,})")
 
     # Reorder columns for clarity
-    base_cols = ["peak_id", "peak_type", "species_detected", "n_species"]
+    base_cols = ["peak_id", "peak_type", "species_detected",
+                 "n_species_det", "n_species_orth"]
     det_cols = [f"{sp}_det" for sp in all_species]
+    orth_cols_ordered = [f"{sp}_orth" for sp in all_species]
 
     coord_cols = []
     gene_cols = []
@@ -1265,7 +1783,7 @@ def build_master_annotation(
         coord_cols.extend([f"{sp}_chr", f"{sp}_start", f"{sp}_end"])
         gene_cols.extend([f"{sp}_gene", f"{sp}_gene_dist"])
 
-    ordered = base_cols + det_cols + coord_cols + gene_cols
+    ordered = base_cols + det_cols + orth_cols_ordered + coord_cols + gene_cols
     # Only keep columns that actually exist
     ordered = [c for c in ordered if c in df.columns]
     remaining = [c for c in df.columns if c not in ordered]
@@ -1283,11 +1801,16 @@ def build_master_annotation(
         print(f"  Total peaks: {len(df):,}")
         print(f"  Columns: {len(df.columns)}")
         print(f"  Peak types: {df['peak_type'].value_counts().to_dict()}")
-        print(f"\n  Detection summary:")
+        print(f"\n  Detection summary (peak called = _det):")
         for sp in all_species:
             col = f"{sp}_det"
             if col in df.columns:
                 print(f"    {sp}: {df[col].sum():,} peaks")
+        print(f"\n  Orthology summary (liftback exists = _orth):")
+        for sp in all_species:
+            col = f"{sp}_orth"
+            if col in df.columns:
+                print(f"    {sp}: {df[col].sum():,} regions")
 
     return df
 
@@ -1800,6 +2323,13 @@ def cross_species_consensus_pipeline(
     min_blocks: Optional[float] = None,
     multiple: bool = False,
     merge_distance: int = 0,
+    merge_method: str = "summit",
+    summit_window: int = 500,
+    cluster_distance: int = 250,
+    max_peak_size: int = 2000,
+    min_peak_size: int = 100,
+    score_col: int = 4,
+    normalize_scores: bool = True,
     peak_prefix: str = "unified",
     gtf_files: Optional[Dict[str, str]] = None,
     pre_lifted_beds: Optional[Dict[str, str]] = None,
@@ -1829,7 +2359,16 @@ def cross_species_consensus_pipeline(
             match ratio (e.g. {'Bonobo': 0.9, 'Macaque': 0.8}).
         min_blocks: Minimum ratio of alignment blocks that must map
         multiple: Allow multiple output regions
-        merge_distance: Distance for merging peaks
+        merge_distance: Distance for merging peaks (only for interval method)
+        merge_method: ``"summit"`` (default) uses summit-based clustering
+            with fixed-width output windows. ``"interval"`` uses the legacy
+            bedtools merge approach on full intervals.
+        summit_window: Width of output consensus peaks (summit method only)
+        cluster_distance: Max distance between summits to cluster (summit only)
+        max_peak_size: Filter out lifted peaks larger than this (summit only)
+        min_peak_size: Filter out lifted peaks smaller than this (summit only)
+        score_col: 0-indexed column for peak scores (summit only, default: 4)
+        normalize_scores: Rank-normalize scores per species (summit only)
         peak_prefix: Prefix for unified peak IDs
         gtf_files: Dict mapping species name to GTF file path (optional)
         pre_lifted_beds: Optional dict mapping species name to path of
@@ -1866,7 +2405,7 @@ def cross_species_consensus_pipeline(
         os.makedirs(d, exist_ok=True)
 
     print("=" * 70)
-    print("CROSS-SPECIES CONSENSUS PIPELINE (v2 - with species tracking)")
+    print(f"CROSS-SPECIES CONSENSUS PIPELINE (v2 - {merge_method} merge)")
     if ncpu > 1:
         print(f"Using {ncpu} parallel workers")
     print("=" * 70)
@@ -1950,7 +2489,7 @@ def cross_species_consensus_pipeline(
     # STEP 2: Merge all species (including human) with species tracking
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP 2: Merge all species with species tracking")
+    print(f"STEP 2: Merge all species with species tracking (method={merge_method})")
     print("-" * 50)
 
     # Build dict of all species BEDs in hg38 coordinates
@@ -1958,12 +2497,29 @@ def cross_species_consensus_pipeline(
     all_species_hg38.update(lifted_beds)
 
     merged_bed = os.path.join(merged_dir, "unified_consensus_hg38_merged.bed")
-    merge_result = merge_with_species_tracking(
-        species_beds=all_species_hg38,
-        output_bed=merged_bed,
-        merge_distance=merge_distance,
-        verbose=verbose,
-    )
+
+    if merge_method == "summit":
+        merge_result = summit_based_merge(
+            species_beds=all_species_hg38,
+            output_bed=merged_bed,
+            summit_window=summit_window,
+            cluster_distance=cluster_distance,
+            max_peak_size=max_peak_size,
+            min_peak_size=min_peak_size,
+            score_col=score_col,
+            normalize_scores=normalize_scores,
+            verbose=verbose,
+        )
+    elif merge_method == "interval":
+        merge_result = merge_with_species_tracking(
+            species_beds=all_species_hg38,
+            output_bed=merged_bed,
+            merge_distance=merge_distance,
+            verbose=verbose,
+        )
+    else:
+        raise ValueError(f"Unknown merge_method: {merge_method!r}. "
+                         f"Use 'summit' or 'interval'.")
     results["merge"] = merge_result
 
     # Add peak IDs (preserve species column)

@@ -117,18 +117,18 @@ def read_fragments_to_df(
         has_header=False,
         skip_rows=skip_rows,
         new_columns=column_names,
-        schema_overrides={
-            'Chromosome': pl.Categorical,
+        dtypes={
+            'Chromosome': pl.Utf8,
             'Start': pl.Int32,
             'End': pl.Int32,
-            'Name': pl.Categorical,
+            'Name': pl.Utf8,
         },
     )
     
     # If no score column or score is '.', compute from duplicates
-    if 'Score' not in df.columns or df.schema.get('Score') == pl.Utf8:
+    if 'Score' not in df.columns or df['Score'].dtype == pl.Utf8:
         df = df.group_by(['Chromosome', 'Start', 'End', 'Name']).agg(
-            pl.len().cast(pl.Int32).alias('Score')
+            pl.count().cast(pl.Int32).alias('Score')
         )
     else:
         df = df.with_columns(pl.col('Score').cast(pl.Int32))
@@ -224,10 +224,10 @@ def fragments_to_coverage(
     n_fragments = 0
     
     # Partition by chromosome
-    per_chrom = {
-        str(chrom): df 
-        for (chrom,), df in fragments_df.partition_by(['Chromosome'], as_dict=True).items()
-    }
+    per_chrom = {}
+    for key, df in fragments_df.group_by('Chromosome'):
+        chrom = key[0] if isinstance(key, tuple) else key
+        per_chrom[str(chrom)] = df
     
     if verbose:
         print(f"Processing {len(per_chrom)} chromosomes...")

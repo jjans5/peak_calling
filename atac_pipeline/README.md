@@ -1,37 +1,60 @@
-# ATAC-seq Peak Calling Pipeline
+# ATAC-seq Cross-Species Peak Analysis Pipeline
 
-A reproducible pipeline for ATAC-seq peak calling across multiple species with liftover to human genome (hg38).
+A reproducible pipeline for ATAC-seq peak calling, cross-species consensus peak analysis, and differential accessibility across 6 primate species.
 
 ## Overview
 
 This pipeline provides a complete workflow for:
 
-1. **Fragment Conversion** - Convert pseudobulk fragment files to Tn5 cut-site BED files
-2. **Peak Calling** - Call peaks using MACS3 with ATAC-seq optimized parameters
-3. **Liftover** - Lift peaks to human genome (hg38) for cross-species comparison
-4. **Consensus Peaks** - Generate consensus peak sets across samples
+1. **Fragment Conversion** — Convert pseudobulk fragment files to Tn5 cut-site BED files
+2. **Peak Calling** — Call peaks using MACS3 with ATAC-seq optimized parameters
+3. **Liftover** — Lift peaks to human genome (hg38) for cross-species comparison
+4. **Consensus Peaks** — Generate consensus peak sets per species
+5. **Cross-Species Consensus** — Summit-based merge of peaks across 6 primates into a unified peak set with master annotation (`_det` / `_orth` tracking)
+6. **Quantification** — BigWig-based quantification of fragment counts over the unified peak set
+7. **Differential Accessibility** — DESeq2 analysis (Python & R) for cross-species comparisons
+8. **Pseudobulk Matrices** — Single-cell fragment → pseudobulk count matrices
+
+### Species
+
+| Species | Assembly | Chain to hg38 |
+|---------|----------|---------------|
+| Human | hg38 | — |
+| Gorilla | gorGor4 | gorGor4ToHg38 |
+| Chimpanzee | panTro5 | panTro5ToHg38 |
+| Bonobo | panPan2 | panPan2ToHg38 |
+| Macaque | rheMac10 | rheMac10ToHg38 |
+| Marmoset | calJac1 | calJac1→calJac4→hg38 (two-step) |
 
 ## Project Structure
 
 ```
 atac_pipeline/
 ├── config/
-│   └── config.yaml          # Main configuration file
+│   ├── config.yaml              # Main configuration
+│   └── assembly_mapping.json    # Assembly ↔ species mapping
 ├── notebooks/
-│   └── 01_peak_calling_workflow.ipynb  # Main analysis notebook
+│   ├── 01_peak_calling_workflow.ipynb    # Config-driven peak calling
+│   ├── 02_flexible_workflow.ipynb        # Manual-path peak calling
+│   ├── 03_liftover_consensus.ipynb       # Liftover consensus BEDs to hg38
+│   ├── 04_cross_species_consensus.ipynb  # Cross-species unified peak set
+│   ├── 05_quantification.ipynb           # BigWig quantification
+│   ├── 06_deseq2_cross_species.ipynb     # DESeq2 (Python/PyDESeq2)
+│   ├── 07_fragment_matrices_pseudobulk.ipynb  # sc fragments → pseudobulk
+│   └── 08_deseq2_R.ipynb                # DESeq2 (R, pairwise comparisons)
 ├── scripts/
-│   ├── liftover_fragments_par.sh       # Parallel fragment liftover
-│   └── subsample_fragments.sh          # Fragment subsampling
+│   ├── liftover_fragments_par.sh         # Parallel fragment liftover
+│   └── subsample_fragments.sh            # Fragment subsampling
 ├── src/
-│   ├── __init__.py          # Package initialization
-│   ├── peak_calling.py      # Peak calling functions
-│   ├── consensus.py         # Consensus peak functions
-│   ├── liftover.py          # Liftover functions
-│   ├── bigwig.py            # BigWig generation
-│   ├── visualization.py     # Plotting functions
-│   └── utils.py             # Utility functions
-├── output/                   # Generated outputs (gitignored)
-├── .gitignore
+│   ├── __init__.py              # Package exports
+│   ├── peak_calling.py          # MACS3 peak calling
+│   ├── consensus.py             # Per-species consensus peaks
+│   ├── liftover.py              # Liftover functions + chain files
+│   ├── cross_species.py         # Cross-species consensus pipeline
+│   ├── quantification.py        # Fragment/BigWig quantification
+│   ├── bigwig.py                # BigWig generation
+│   ├── visualization.py         # Plotting functions
+│   └── utils.py                 # Utility functions
 └── README.md
 ```
 
@@ -237,31 +260,34 @@ Edit `config/config.yaml` to customize:
 - **Consensus parameters**: Peak width, filters
 - **Parallel workers**: CPU/thread allocation
 
-## Supported Species
+## Cross-Species Approach
 
-| Species | Genome | Chain to hg38 |
-|---------|--------|---------------|
-| Human | hg38 | - |
-| Gorilla | gorGor4 | gorGor4ToHg38 |
-| Chimpanzee | panTro5 | panTro5ToHg38 |
-| Bonobo | panPan2 | panPan2ToHg38 |
-| Macaque | rheMac10 | rheMac10ToHg38 |
-| Marmoset | calJac1 | calJac1→calJac4→hg38 |
+Our pipeline uses **pairwise UCSC liftOver chains** to map peaks between assemblies. The cross-species consensus is built via `summit_based_merge()`:
 
-## Output Files
+1. All species' consensus peaks are lifted to hg38
+2. Peaks are clustered using bedtools (`-d 250`) on hg38 coordinates
+3. Within each cluster, a score-weighted center is computed
+4. Fixed 500bp windows are placed around each center
+5. The unified set is lifted back to each native assembly for species-specific analysis
 
-### Per Sample
-- `{sample}_peaks.narrowPeak`: Peak calls (BED6+4)
-- `{sample}_peaks.xls`: Peak statistics
-- `{sample}_summits.bed`: Peak summit positions
+The master annotation tracks two distinct concepts per species:
+- **`{Species}_det`** — A peak was *called* (detected) in that species near this location
+- **`{Species}_orth`** — The unified peak could be *lifted back* to that species (ortholog exists)
 
-### Summary
-- `peak_counts_report.tsv`: Peaks per cell type
-- `macs3_parameters.json`: Run parameters
+This mirrors the orthology-vs-activity distinction used by the Zoonomia consortium (Kaplow et al. Science 2023), though they use Cactus multi-genome alignment + HALPER across 222 mammals, while we use pairwise liftOver for 6 closely-related primates with direct ATAC-seq measurement in each.
 
-### Consensus
-- `consensus_peaks.bed`: Final consensus peaks
-- `consensus_peaks_report.md`: Summary statistics
+## Key Output Files
+
+### Per Species
+- `{sample}_peaks.narrowPeak` — Peak calls (BED6+4)
+- `{sample}_summits.bed` — Peak summit positions
+- `Consensus_Peaks_Filtered_500.bed` — Per-species consensus (500bp fixed-width)
+
+### Cross-Species
+- `unified_peaks.bed` — Merged peak set on hg38 (all species)
+- `master_annotation.tsv` — Full annotation with `_det`, `_orth`, `n_species_det`, `n_species_orth`
+- `peak_matrix.tsv` — Binary presence/absence matrix
+- `{Species}_specific_peaks.bed` — Peaks unique to one species
 
 ## Visualization
 
@@ -283,8 +309,10 @@ plot_peak_distribution(consensus_peaks, target_width=500)
 
 MIT License
 
-## Citation
+## References
 
-If you use this pipeline, please cite:
 - MACS3: Zhang et al., 2008
 - pyranges: Stovner & Sætrom, 2020
+- Zoonomia TACIT: Kaplow et al., Science 2023
+- HALPER: Zhang et al., Bioinformatics 2020
+- UCSC liftOver: Hinrichs et al., 2006
