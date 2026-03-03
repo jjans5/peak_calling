@@ -768,6 +768,14 @@ def find_human_specific_peaks(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
+    .. deprecated::
+        This function uses **detection-based** overlap to find human peaks
+        not overlapping any NHP called peak.  This conflates "no peak called"
+        with "no orthologous sequence".  Use the orthology-based
+        classification in ``build_master_annotation()`` instead, which
+        identifies human-specific peaks as those where liftback to every
+        NHP species failed (``n_species_orth == 1``).
+
     Find human peaks that do not overlap any non-human lifted peak.
 
     **Important**: These are peaks where no other species had a *called peak*
@@ -1207,7 +1215,12 @@ def add_peak_ids_to_human_specific(
     output_bed: str,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Add human-specific peak IDs (human_peak_NNNNNN)."""
+    """Add human-specific peak IDs (human_peak_NNNNNN).
+
+    .. deprecated::
+        No longer used in the pipeline.  Human-specific IDs are assigned
+        in ``build_master_annotation()`` after orthology-based classification.
+    """
     return add_peak_ids(input_bed, output_bed, prefix="human_peak", verbose=verbose)
 
 
@@ -1524,6 +1537,11 @@ def build_master_annotation(
         compatibility but is **not used**.  Human-specific peaks are
         identified from the unified set based on liftback orthology
         (``n_species_orth == 1``), not from a separate BED file.
+
+        Input peaks typically have temporary IDs (``temp_NNNNNN``).
+        This function assigns **final** IDs (``unified_NNNNNN``,
+        ``human_peak_NNNNNN``) based on the orthology classification.
+        These final IDs are never changed downstream.
     """
     if verbose:
         print("Building master annotation table...")
@@ -1765,9 +1783,10 @@ def build_master_annotation(
               f"{(df['peak_type'] == 'unified').sum():,} "
               f"(n_species_orth >= 2)")
 
-    # --- Rename peak IDs to match final classification ---
-    # After reclassification some peaks that were unified_NNNNNN are now
-    # human_specific.  Renumber so that IDs are clean and sequential:
+    # --- Assign final peak IDs based on classification ---
+    # Intermediate files use temp_NNNNNN IDs (or whatever peak_prefix was).
+    # Now that we know the final classification, assign clean sequential
+    # IDs that will NEVER change downstream:
     #   unified        -> unified_000001, unified_000002, ...
     #   human_specific -> human_peak_000001, human_peak_000002, ...
     #   {sp}_specific  -> keep existing IDs (already correctly named)
@@ -2372,7 +2391,7 @@ def cross_species_consensus_pipeline(
     min_peak_size: int = 100,
     score_col: int = 4,
     normalize_scores: bool = True,
-    peak_prefix: str = "unified",
+    peak_prefix: str = "temp",
     gtf_files: Optional[Dict[str, str]] = None,
     pre_lifted_beds: Optional[Dict[str, str]] = None,
     verbose: bool = True,
@@ -2383,12 +2402,20 @@ def cross_species_consensus_pipeline(
 
     Steps:
     1. Liftover all non-human species peaks to hg38 (or load pre-lifted)
-    2. Merge lifted peaks + human peaks, tracking species of origin
-    3. Identify human-specific peaks (human peaks not overlapping any non-human)
-    4. Add peak IDs for tracking
-    5. Liftover unified peaks back to each species
-    6. Identify species-specific peaks for each non-human species
-    7. Annotate all peaks with closest gene
+    2. Merge lifted peaks + human peaks (assigned temp IDs)
+    3. (skipped — human-specific classification via orthology in Step 7)
+    4. Liftover temp consensus peaks back to each species
+    5. Identify species-specific peaks for each non-human species
+    6. Annotate all peaks with closest gene
+    7. Build master annotation — reclassify peaks using orthology:
+       ``temp_NNNNNN`` → ``unified_NNNNNN`` (n_species_orth ≥ 2)
+       or ``human_peak_NNNNNN`` (liftback to all NHP failed)
+    8. Cross-map species-specific peaks via direct inter-species chains
+
+    Peak IDs:
+    - Intermediate files use ``temp_NNNNNN`` (or custom ``peak_prefix``).
+    - Final IDs are assigned in Step 7 and are **never changed** after that.
+    - Species-specific peaks use ``{species}_peak_NNNNNN`` throughout.
 
     Args:
         species_beds: Dict mapping non-human species name to input BED file path
@@ -2411,7 +2438,9 @@ def cross_species_consensus_pipeline(
         min_peak_size: Filter out lifted peaks smaller than this (summit only)
         score_col: 0-indexed column for peak scores (summit only, default: 4)
         normalize_scores: Rank-normalize scores per species (summit only)
-        peak_prefix: Prefix for unified peak IDs
+        peak_prefix: Prefix for temporary peak IDs used in intermediate
+            files.  Final IDs (``unified_NNNNNN``, ``human_peak_NNNNNN``) are
+            assigned in Step 7 after orthology-based classification.
         gtf_files: Dict mapping species name to GTF file path (optional)
         pre_lifted_beds: Optional dict mapping species name to path of
             pre-computed liftover BED files (already in hg38 coords).
@@ -2428,7 +2457,6 @@ def cross_species_consensus_pipeline(
     results = {
         "lift_to_human": {},
         "merge": None,
-        "human_specific": None,
         "lift_back": {},
         "species_specific": {},
         "output_files": {},
@@ -2437,12 +2465,11 @@ def cross_species_consensus_pipeline(
     # Create output directories
     lift_human_dir = os.path.join(output_dir, "01_lifted_to_human")
     merged_dir = os.path.join(output_dir, "02_merged_consensus")
-    human_specific_dir = os.path.join(output_dir, "03_human_specific")
     lift_back_dir = os.path.join(output_dir, "04_lifted_back")
     species_specific_dir = os.path.join(output_dir, "05_species_specific")
     annotation_dir = os.path.join(output_dir, "06_annotation")
 
-    for d in [lift_human_dir, merged_dir, human_specific_dir, lift_back_dir,
+    for d in [lift_human_dir, merged_dir, lift_back_dir,
               species_specific_dir, annotation_dir]:
         os.makedirs(d, exist_ok=True)
 
@@ -2575,25 +2602,20 @@ def cross_species_consensus_pipeline(
     results["output_files"]["unified_consensus"] = merged_with_ids
 
     # =========================================================================
-    # STEP 3: Identify human-specific peaks
+    # STEP 3: (skipped) Human-specific peaks identified in Step 7
     # =========================================================================
+    # Human-specific peak classification is done in Step 7
+    # (build_master_annotation) using liftback orthology: peaks where the
+    # liftback to EVERY NHP species failed (n_species_orth == 1) are
+    # classified as human_specific.  This is the correct definition —
+    # regions that cannot be transferred to other genomes.
+    #
+    # The old Step 3 used detection-based overlap (bedtools intersect -v)
+    # which conflated "no peak called" with "no orthologous sequence".
     print("\n" + "=" * 70)
-    print("STEP 3: Identify human-specific peaks")
+    print("STEP 3: (skipped — human-specific identified via orthology in Step 7)")
     print("-" * 50)
-
-    human_specific_raw = os.path.join(human_specific_dir, "human_specific_peaks_raw.bed")
-    hs_result = find_human_specific_peaks(
-        human_bed=human_bed,
-        nonhuman_lifted_beds=list(lifted_beds.values()),
-        output_bed=human_specific_raw,
-        verbose=verbose,
-    )
-
-    # Add peak IDs to human-specific
-    human_specific_bed = os.path.join(human_specific_dir, "human_specific_peaks.bed")
-    add_peak_ids_to_human_specific(human_specific_raw, human_specific_bed, verbose=verbose)
-    results["human_specific"] = hs_result
-    results["output_files"]["human_specific"] = human_specific_bed
+    print("   Human-specific peaks will be identified after liftback (Step 7).")
 
     # =========================================================================
     # STEP 4: Liftover unified peaks back to each species
@@ -2673,7 +2695,7 @@ def cross_species_consensus_pipeline(
 
     annotation_result = create_peak_annotation(
         unified_bed=merged_with_ids,
-        human_specific_bed=human_specific_bed,
+        human_specific_bed="",  # not available yet; classified in Step 7
         species_specific_beds=species_specific_beds,
         gtf_files=gtf_files,
         output_dir=annotation_dir,
@@ -2695,7 +2717,7 @@ def cross_species_consensus_pipeline(
 
     master_df = build_master_annotation(
         unified_bed=merged_with_ids,
-        human_specific_bed=human_specific_bed,
+        human_specific_bed="",  # not used; orthology-based classification
         species_specific_beds=species_specific_beds,
         liftback_dir=lift_back_dir,
         gene_bed_dir=os.path.join(annotation_dir, "gene_beds"),
@@ -2729,14 +2751,26 @@ def cross_species_consensus_pipeline(
     results["output_files"]["cross_mapping"] = os.path.join(cross_map_dir, "species_specific_cross_mapping.tsv")
 
     # =========================================================================
-    # SUMMARY
+    # SUMMARY (orthology-based classification from master annotation)
     # =========================================================================
     print("\n" + "=" * 70)
     print("PIPELINE SUMMARY")
     print("=" * 70)
 
-    print(f"\n   Unified consensus: {merge_result['merged_peaks']:,} peaks")
-    print(f"   Human-specific: {hs_result['human_specific']:,} peaks")
+    # Peak counts from master annotation (orthology-based)
+    type_counts = master_df["peak_type"].value_counts()
+    n_unified = type_counts.get("unified", 0)
+    n_human_specific = type_counts.get("human_specific", 0)
+    n_total_master = len(master_df)
+
+    print(f"\n   Initial merged peaks (temp IDs): {merge_result['merged_peaks']:,}")
+    print(f"   After orthology-based classification:")
+    print(f"      Unified (n_species_orth >= 2):  {n_unified:,}")
+    print(f"      Human-specific (no NHP orth):   {n_human_specific:,}")
+    for pt, count in type_counts.items():
+        if pt not in ("unified", "human_specific"):
+            print(f"      {pt}: {count:,}")
+    print(f"      Total: {n_total_master:,}")
 
     print(f"\n   Liftback results:")
     print(f"   {'Species':<15} {'Lifted':>10} {'Unmapped':>10} {'Success':>10}")
@@ -2749,7 +2783,7 @@ def cross_species_consensus_pipeline(
             pct = (lifted / total * 100) if total > 0 else 0
             print(f"   {species:<15} {lifted:>10,} {unmapped:>10,} {pct:>9.1f}%")
 
-    print(f"\n   Species-specific peaks:")
+    print(f"\n   Species-specific peaks (NHP, could not lift to hg38):")
     for species, sp_result in results["species_specific"].items():
         n = sp_result.get("species_specific", 0)
         pct = sp_result.get("pct_specific", 0)
@@ -2763,8 +2797,9 @@ def cross_species_consensus_pipeline(
     results["status"] = "success"
     results["message"] = (
         f"Pipeline complete. "
-        f"Unified: {merge_result['merged_peaks']:,}, "
-        f"Human-specific: {hs_result['human_specific']:,}"
+        f"Unified: {n_unified:,}, "
+        f"Human-specific (orthology): {n_human_specific:,}, "
+        f"Total: {n_total_master:,}"
     )
 
     return results
