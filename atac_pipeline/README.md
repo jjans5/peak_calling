@@ -274,8 +274,6 @@ The master annotation tracks two distinct concepts per species:
 - **`{Species}_det`** — A peak was *called* (detected) in that species near this location
 - **`{Species}_orth`** — The unified peak could be *lifted back* to that species (ortholog exists)
 
-This mirrors the orthology-vs-activity distinction used by the Zoonomia consortium (Kaplow et al. Science 2023), though they use Cactus multi-genome alignment + HALPER across 222 mammals, while we use pairwise liftOver for 6 closely-related primates with direct ATAC-seq measurement in each.
-
 ## Key Output Files
 
 ### Per Species
@@ -313,6 +311,4 @@ MIT License
 
 - MACS3: Zhang et al., 2008
 - pyranges: Stovner & Sætrom, 2020
-- Zoonomia TACIT: Kaplow et al., Science 2023
-- HALPER: Zhang et al., Bioinformatics 2020
 - UCSC liftOver: Hinrichs et al., 2006

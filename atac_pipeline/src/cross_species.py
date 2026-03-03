@@ -2,7 +2,7 @@
 Cross-Species Peak Analysis Pipeline
 =====================================
 
-Pipeline for comparing ATAC-seq peaks across species:
+Pipeline for comparing ATAC-seq peaks across species using UCSC liftOver:
 1. Liftover non-human species peaks to human (hg38)
 2. Merge ALL species (including human) into unified consensus, tracking species origin
 3. Identify human-specific peaks (not overlapping any non-human lifted peak)
