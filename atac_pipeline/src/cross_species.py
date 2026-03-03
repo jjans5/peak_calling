@@ -1491,24 +1491,39 @@ def build_master_annotation(
     """
     Build a comprehensive master annotation table with one row per peak.
 
+    Peak classification (determined by **orthology**, not detection):
+
+      - ``unified``: the orthologous genomic region exists in **≥2 species**
+        (``n_species_orth >= 2``).  The peak may be *detected* (called) in
+        only one species — that indicates regulatory divergence, not absence
+        of the sequence.
+      - ``human_specific``: the region exists **only in human**
+        (``n_species_orth == 1``).  Liftback to every NHP species failed.
+        This is symmetric with NHP ``{species}_specific`` peaks, which are
+        original NHP peaks that could not be lifted to hg38.
+      - ``{species}_specific``: original NHP peaks that could not be lifted
+        to hg38 and therefore have no orthologous region in the human genome.
+
     Columns:
       - peak_id (index)
-      - peak_type: 'unified', 'human_specific', '{species}_specific'
+      - peak_type: ``'unified'``, ``'human_specific'``, ``'{species}_specific'``
       - Human_chr, Human_start, Human_end (hg38 coords for unified/hs peaks)
       - {Species}_chr, {Species}_start, {Species}_end (liftback coords)
       - Human_gene, Human_gene_dist
       - {Species}_gene, {Species}_gene_dist (from bedtools closest on liftback)
       - {Species}_det: binary 0/1 — a peak was *called* in that species
-        during the original peak-calling step AND overlapped this consensus
-        peak during the cross-species merge.
       - {Species}_orth: binary 0/1 — the orthologous genomic region *exists*
-        in that species (liftback from hg38 succeeded). A peak can have
-        ``_orth=1`` but ``_det=0`` when the sequence is conserved but
-        the regulatory element is not active (no peak called).
+        in that species (liftback from hg38 succeeded)
       - n_species_det: count of species with ``_det=1``
       - n_species_orth: count of species with ``_orth=1``
 
     For species-specific peaks, only the native species coords are populated.
+
+    Note:
+        The ``human_specific_bed`` parameter is accepted for API
+        compatibility but is **not used**.  Human-specific peaks are
+        identified from the unified set based on liftback orthology
+        (``n_species_orth == 1``), not from a separate BED file.
     """
     if verbose:
         print("Building master annotation table...")
@@ -1550,42 +1565,18 @@ def build_master_annotation(
                 all_rows.append(row)
 
     # ------------------------------------------------------------------
-    # 2. Human-specific peaks
+    # 2. Human-specific classification (orthology-based)
     # ------------------------------------------------------------------
+    # Human-specific peaks are NOT loaded from a separate BED file.
+    # Instead, they are identified from the unified set in step 6
+    # after liftback coordinates reveal which species have orthologous
+    # regions.  Unified peaks with n_species_orth == 1 (liftback to
+    # every NHP species failed) are reclassified as human_specific.
+    # This is symmetric with NHP species-specific peaks, which are
+    # original NHP peaks that could not be lifted to hg38.
     if verbose:
-        print("  2. Loading human-specific peaks...")
-
-    if os.path.exists(human_specific_bed):
-        # Load human-specific gene annotation if it exists
-        hs_gene_tsv = os.path.join(
-            os.path.dirname(human_gene_annotation_tsv),
-            "human_specific_gene_annotation.tsv",
-        )
-        hs_gene_map = {}
-        if os.path.exists(hs_gene_tsv):
-            hsg = pd.read_csv(hs_gene_tsv, sep="\t")
-            hs_gene_map = dict(zip(
-                hsg["peak_id"],
-                zip(hsg["closest_gene"], hsg["distance_to_gene"]),
-            ))
-
-        with open(human_specific_bed) as f:
-            for line in f:
-                if line.strip() and not line.startswith("#"):
-                    parts = line.strip().split("\t")
-                    pid = parts[3] if len(parts) > 3 else f"{parts[0]}:{parts[1]}-{parts[2]}"
-                    row = {
-                        "peak_id": pid,
-                        "peak_type": "human_specific",
-                        "Human_chr": parts[0],
-                        "Human_start": int(parts[1]),
-                        "Human_end": int(parts[2]),
-                        "species_detected": "Human",
-                    }
-                    if pid in hs_gene_map:
-                        row["Human_gene"] = hs_gene_map[pid][0]
-                        row["Human_gene_dist"] = int(hs_gene_map[pid][1])
-                    all_rows.append(row)
+        print("  2. (human_specific peaks will be identified from "
+              "unified set after liftback in step 6)")
 
     # ------------------------------------------------------------------
     # 3. Liftback coordinates for unified peaks
@@ -1746,11 +1737,10 @@ def build_master_annotation(
     # (i.e., the liftback from hg38 succeeded). A peak with _orth=1 but
     # _det=0 means the genomic region is conserved but no peak was called
     # there in that species (regulatory divergence).
-    # Human always has _orth=1 for unified/human_specific peaks (they are
-    # defined in hg38). For NHP species, _orth=1 iff liftback coords exist.
-    df["Human_orth"] = df["peak_type"].isin(
-        ["unified", "human_specific"]
-    ).astype(int)
+    # Human_orth=1 for all peaks that are defined in hg38 (currently all
+    # have peak_type="unified"; human_specific is assigned below).
+    # For NHP species, _orth=1 iff liftback coords exist.
+    df["Human_orth"] = (df["peak_type"] == "unified").astype(int)
 
     for sp in species_list:
         chr_col = f"{sp}_chr"
@@ -1758,6 +1748,58 @@ def build_master_annotation(
 
     orth_cols = [f"{sp}_orth" for sp in all_species]
     df["n_species_orth"] = df[[c for c in orth_cols if c in df.columns]].sum(axis=1)
+
+    # --- Reclassify unified peaks with no NHP ortholog as human_specific ---
+    # A unified peak with n_species_orth == 1 means the liftback to EVERY
+    # NHP species failed — the genomic region only exists in the human
+    # genome.  This is the exact analogue of NHP species-specific peaks
+    # (original NHP peaks that could not be lifted to hg38).
+    mask_human_only = (df["peak_type"] == "unified") & (df["n_species_orth"] == 1)
+    n_reclassified = mask_human_only.sum()
+    df.loc[mask_human_only, "peak_type"] = "human_specific"
+
+    if verbose:
+        print(f"    Reclassified {n_reclassified:,} unified peaks as "
+              f"human_specific (n_species_orth == 1)")
+        print(f"    Remaining unified: "
+              f"{(df['peak_type'] == 'unified').sum():,} "
+              f"(n_species_orth >= 2)")
+
+    # --- Rename peak IDs to match final classification ---
+    # After reclassification some peaks that were unified_NNNNNN are now
+    # human_specific.  Renumber so that IDs are clean and sequential:
+    #   unified        -> unified_000001, unified_000002, ...
+    #   human_specific -> human_peak_000001, human_peak_000002, ...
+    #   {sp}_specific  -> keep existing IDs (already correctly named)
+    id_mapping = {}  # old_id -> new_id
+    unified_counter = 0
+    hs_counter = 0
+
+    for idx in df.index:
+        old_id = df.at[idx, "peak_id"]
+        pt = df.at[idx, "peak_type"]
+        if pt == "unified":
+            unified_counter += 1
+            id_mapping[old_id] = f"unified_{unified_counter:06d}"
+        elif pt == "human_specific":
+            hs_counter += 1
+            id_mapping[old_id] = f"human_peak_{hs_counter:06d}"
+        else:
+            id_mapping[old_id] = old_id  # species-specific: keep as-is
+
+    df["peak_id"] = df["peak_id"].map(id_mapping)
+
+    # Save mapping so downstream notebook can update BED files
+    mapping_file = output_file.replace(".tsv", "_id_mapping.tsv")
+    pd.DataFrame(
+        list(id_mapping.items()), columns=["old_id", "new_id"],
+    ).to_csv(mapping_file, sep="\t", index=False)
+
+    if verbose:
+        n_changed = sum(1 for k, v in id_mapping.items() if k != v)
+        print(f"    Renamed {n_changed:,} peak IDs "
+              f"({unified_counter:,} unified, {hs_counter:,} human_specific)")
+        print(f"    Saved ID mapping: {os.path.basename(mapping_file)}")
 
     if verbose:
         # Show the discrepancy between det and orth
