@@ -3,19 +3,27 @@ Cross-Species Peak Analysis Pipeline
 =====================================
 
 Pipeline for comparing ATAC-seq peaks across species using UCSC liftOver:
+
 1. Liftover non-human species peaks to human (hg38)
 2. Merge ALL species (including human) into unified consensus, tracking species origin
-3. Identify human-specific peaks (not overlapping any non-human lifted peak)
-4. Add peak IDs for tracking
-5. Liftover unified peaks back to each species
-6. Identify species-specific peaks (original species peaks not in unified set)
-7. Annotate all peaks with closest gene from GTF
+   (summit-based clustering with fixed-width output)
+3. *(skipped — human-specific classification via orthology in Step 7)*
+4. Liftover unified consensus peaks back to each species
+   - 4b. (optional) Filter liftback peaks by size
+   - 4c. (optional) Reciprocal liftover check (round-trip NHP→hg38 overlap)
+   - 4d. (optional) Per-peak liftover conservation scoring (match_ratio 0–1)
+5. Identify species-specific peaks for each non-human species
+6. Annotate all peaks with closest gene from GTF
+7. Build master annotation — reclassify peaks using orthology
+   (unified vs human_specific based on liftback success)
+8. Cross-map species-specific peaks via direct inter-species chains
 
 Author: J. Janssens
 """
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -23,6 +31,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union
 from collections import defaultdict
 
 import pandas as pd
+import numpy as np
 
 from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR, compute_liftover_similarity
 
@@ -796,6 +805,13 @@ def find_human_specific_peaks(
     Returns:
         Dictionary with statistics
     """
+    import warnings
+    warnings.warn(
+        "find_human_specific_peaks() is deprecated. Use orthology-based "
+        "classification in build_master_annotation() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+
     if verbose:
         print("Finding human-specific peaks...")
 
@@ -1270,6 +1286,1426 @@ def liftback_peaks(
         )
 
     return result
+
+
+# =============================================================================
+# POST-LIFTBACK SIZE FILTERING
+# =============================================================================
+
+def filter_liftback_by_size(
+    liftback_dir: str,
+    output_dir: str,
+    species_list: List[str],
+    min_liftback_size: int = 100,
+    max_liftback_size: int = 5000,
+    file_pattern: str = "unified_consensus_{species}.bed",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Filter liftback BED files by peak size, discarding peaks that became
+    too large or too small during the liftover round-trip.
+
+    UCSC liftOver's ``-minMatch`` parameter controls what fraction of input
+    bases must remap, but does NOT constrain the size of the output region.
+    Structural rearrangements and lineage-specific insertions in the target
+    genome can cause a 500 bp input peak to span hundreds of kilobases in
+    the output.  This function removes such artefacts.
+
+    For every species, writes:
+      - ``{output_dir}/{stem}_filtered.bed``  — peaks that pass the size filter
+      - ``{output_dir}/{stem}_size_rejected.bed`` — peaks that failed
+
+    Parameters
+    ----------
+    liftback_dir : str
+        Directory containing liftback BED files (from Step 4).
+    output_dir : str
+        Directory for filtered output files.
+    species_list : list of str
+        NHP species names (e.g. ["Bonobo", "Chimpanzee", ...]).
+    min_liftback_size : int
+        Minimum allowed peak size in target genome (default 100 bp).
+    max_liftback_size : int
+        Maximum allowed peak size in target genome (default 5000 bp).
+    file_pattern : str
+        Filename pattern with ``{species}`` placeholder.
+    verbose : bool
+        Print per-species filtering statistics.
+
+    Returns
+    -------
+    dict
+        ``{species: {"input": N, "kept": N, "rejected": N,
+                     "output_file": path, "rejected_file": path}}``
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    results = {}
+
+    if verbose:
+        print(f"\nFiltering liftback peaks by size "
+              f"[{min_liftback_size:,} – {max_liftback_size:,} bp]")
+        print(f"  Input dir:  {liftback_dir}")
+        print(f"  Output dir: {output_dir}")
+        print(f"  {'Species':<15s} {'Input':>8s} {'Kept':>8s} "
+              f"{'Rejected':>8s} {'%Kept':>8s}")
+        print("  " + "-" * 55)
+
+    for species in species_list:
+        fname = file_pattern.format(species=species)
+        input_bed = os.path.join(liftback_dir, fname)
+        if not os.path.exists(input_bed):
+            if verbose:
+                print(f"  {species:<15s} (file not found, skipping)")
+            continue
+
+        stem = fname.replace(".bed", "")
+        filtered_bed = os.path.join(output_dir, f"{stem}_filtered.bed")
+        rejected_bed = os.path.join(output_dir, f"{stem}_size_rejected.bed")
+
+        n_input = n_kept = n_rejected = 0
+        with open(input_bed) as fin, \
+             open(filtered_bed, 'w') as fout, \
+             open(rejected_bed, 'w') as frej:
+            for line in fin:
+                if not line.strip() or line.startswith('#'):
+                    continue
+                n_input += 1
+                parts = line.strip().split('\t')
+                size = int(parts[2]) - int(parts[1])
+                # Write only chr, start, end, peak_id (4 columns)
+                bed4 = f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n"
+                if min_liftback_size <= size <= max_liftback_size:
+                    fout.write(bed4)
+                    n_kept += 1
+                else:
+                    frej.write(bed4)
+                    n_rejected += 1
+
+        pct = (n_kept / n_input * 100) if n_input > 0 else 0
+        results[species] = {
+            "input": n_input,
+            "kept": n_kept,
+            "rejected": n_rejected,
+            "output_file": filtered_bed,
+            "rejected_file": rejected_bed,
+        }
+
+        if verbose:
+            print(f"  {species:<15s} {n_input:>8,} {n_kept:>8,} "
+                  f"{n_rejected:>8,} {pct:>7.1f}%")
+
+    return results
+
+
+def update_master_after_filtering(
+    master_file: str,
+    filter_results: Dict[str, Dict],
+    output_file: Optional[str] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Update the master annotation table after liftback size filtering.
+
+    For each species where peaks were rejected, sets ``{Species}_orth = 0``
+    and clears the liftback coordinates.  Then recalculates
+    ``n_species_orth`` and reclassifies peaks whose orthology count dropped
+    to 1 as ``human_specific``.
+
+    Parameters
+    ----------
+    master_file : str
+        Path to the existing master_annotation.tsv (from Step 7).
+    filter_results : dict
+        Output of :func:`filter_liftback_by_size`.
+    output_file : str, optional
+        Where to save the updated table.  If *None*, overwrites
+        ``master_file`` with ``_filtered`` suffix.
+    verbose : bool
+        Print summary of changes.
+
+    Returns
+    -------
+    pd.DataFrame
+        Updated master annotation.
+    """
+    df = pd.read_csv(master_file, sep="\t", index_col="peak_id")
+    original_types = df["peak_type"].value_counts().to_dict()
+
+    if output_file is None:
+        output_file = master_file.replace(".tsv", "_filtered.tsv")
+
+    # Collect rejected peak IDs per species from the rejected BED files
+    rejected_ids = {}  # species -> set of peak_ids
+    for species, info in filter_results.items():
+        rej_file = info.get("rejected_file")
+        if rej_file and os.path.exists(rej_file):
+            ids = set()
+            with open(rej_file) as f:
+                for line in f:
+                    if line.strip() and not line.startswith('#'):
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 4:
+                            ids.add(parts[3])
+            rejected_ids[species] = ids
+
+    # Clear orthology for rejected peaks
+    total_cleared = 0
+    for species, ids in rejected_ids.items():
+        orth_col = f"{species}_orth"
+        chr_col = f"{species}_chr"
+        start_col = f"{species}_start"
+        end_col = f"{species}_end"
+
+        mask = df.index.isin(ids)
+        n_cleared = mask.sum()
+        total_cleared += n_cleared
+
+        if orth_col in df.columns:
+            df.loc[mask, orth_col] = 0
+        for col in [chr_col, start_col, end_col]:
+            if col in df.columns:
+                df.loc[mask, col] = np.nan
+
+        if verbose and n_cleared > 0:
+            print(f"  {species}: cleared orthology for {n_cleared:,} "
+                  f"size-rejected peaks")
+
+    # Recalculate n_species_orth
+    orth_cols = [c for c in df.columns if c.endswith("_orth")]
+    df["n_species_orth"] = df[orth_cols].sum(axis=1)
+
+    # Reclassify: unified peaks that lost all NHP orthologs -> human_specific
+    mask_reclassify = (
+        (df["peak_type"] == "unified") &
+        (df["n_species_orth"] == 1)
+    )
+    n_reclassified = mask_reclassify.sum()
+    df.loc[mask_reclassify, "peak_type"] = "human_specific"
+
+    # Reassign IDs for newly reclassified peaks
+    if n_reclassified > 0:
+        # Find current max human_peak number
+        existing_hs = [idx for idx in df.index if idx.startswith("human_peak_")]
+        if existing_hs:
+            max_hs_num = max(int(idx.split("_")[-1]) for idx in existing_hs)
+        else:
+            max_hs_num = 0
+
+        new_mapping = {}
+        counter = max_hs_num
+        for idx in df.index[mask_reclassify]:
+            if not idx.startswith("human_peak_"):
+                counter += 1
+                new_mapping[idx] = f"human_peak_{counter:06d}"
+
+        if new_mapping:
+            df = df.rename(index=new_mapping)
+
+    # Save
+    df.to_csv(output_file, sep="\t")
+
+    new_types = df["peak_type"].value_counts().to_dict()
+
+    if verbose:
+        print(f"\n  Master annotation updated:")
+        print(f"    Before: {original_types}")
+        print(f"    After:  {new_types}")
+        if n_reclassified > 0:
+            print(f"    Reclassified {n_reclassified:,} unified -> human_specific "
+                  f"(lost all NHP orthologs after size filter)")
+        print(f"    Saved: {output_file}")
+
+    return df
+
+
+def filter_and_update_master(
+    output_dir: str,
+    species_list: List[str],
+    min_liftback_size: int = 100,
+    max_liftback_size: int = 5000,
+    liftback_subdir: str = "04_lifted_back",
+    master_subdir: str = "07_master_annotation",
+    filter_subdir: str = "04_lifted_back_filtered",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    One-call convenience: filter all liftback files + update master annotation.
+
+    This is the **recommended way** to apply post-liftback size filtering
+    to an existing pipeline run without re-running the full pipeline.
+
+    Creates files in ``{output_dir}/{filter_subdir}/`` and saves the updated
+    master annotation as ``master_annotation_filtered.tsv``.
+
+    Parameters
+    ----------
+    output_dir : str
+        Top-level pipeline output directory (e.g. ``cross_species_consensus_v2``).
+    species_list : list of str
+        NHP species (e.g. ``["Bonobo", "Chimpanzee", ...]``).
+    min_liftback_size : int
+        Minimum peak size in target genome (default 100 bp).
+    max_liftback_size : int
+        Maximum peak size in target genome (default 5000 bp).
+    liftback_subdir : str
+        Subdirectory with liftback BED files (default ``04_lifted_back``).
+    master_subdir : str
+        Subdirectory with master annotation (default ``07_master_annotation``).
+    filter_subdir : str
+        Subdirectory for filtered output (default ``04_lifted_back_filtered``).
+    verbose : bool
+        Print filtering stats and master annotation changes.
+
+    Returns
+    -------
+    dict
+        ``{"filter_results": {species: stats}, "master_df": DataFrame,
+          "master_file": path, "filter_dir": path}``
+
+    Example
+    -------
+    >>> from src.cross_species import filter_and_update_master
+    >>> result = filter_and_update_master(
+    ...     output_dir="/path/to/cross_species_consensus_v2",
+    ...     species_list=["Bonobo", "Chimpanzee", "Gorilla", "Macaque", "Marmoset"],
+    ...     min_liftback_size=100,
+    ...     max_liftback_size=5000,
+    ... )
+    """
+    liftback_dir = os.path.join(output_dir, liftback_subdir)
+    master_file = os.path.join(output_dir, master_subdir, "master_annotation.tsv")
+    filter_dir = os.path.join(output_dir, filter_subdir)
+
+    if verbose:
+        print("=" * 70)
+        print("POST-LIFTBACK SIZE FILTERING")
+        print("=" * 70)
+
+    # 1. Filter liftback BEDs
+    filter_results = filter_liftback_by_size(
+        liftback_dir=liftback_dir,
+        output_dir=filter_dir,
+        species_list=species_list,
+        min_liftback_size=min_liftback_size,
+        max_liftback_size=max_liftback_size,
+        verbose=verbose,
+    )
+
+    # 2. Update master annotation
+    filtered_master_file = os.path.join(
+        output_dir, master_subdir, "master_annotation_filtered.tsv"
+    )
+    master_df = update_master_after_filtering(
+        master_file=master_file,
+        filter_results=filter_results,
+        output_file=filtered_master_file,
+        verbose=verbose,
+    )
+
+    # 3. Regenerate combined BED files with filtered liftback coords
+    combined_dir = os.path.join(output_dir, "09_combined_filtered")
+    os.makedirs(combined_dir, exist_ok=True)
+
+    if verbose:
+        print(f"\n  Regenerating combined BED files in {combined_dir}/")
+
+    # Unified peaks hg38
+    unified_hg38 = os.path.join(combined_dir, "unified_peaks_hg38.bed")
+    n_uni = 0
+    with open(unified_hg38, 'w') as fout:
+        for pid, row in master_df[master_df["peak_type"] == "unified"].iterrows():
+            fout.write(f"{row['Human_chr']}\t{int(row['Human_start'])}\t"
+                       f"{int(row['Human_end'])}\t{pid}\n")
+            n_uni += 1
+
+    # Human-specific peaks
+    hs_hg38 = os.path.join(combined_dir, "human_specific_peaks_hg38.bed")
+    n_hs = 0
+    with open(hs_hg38, 'w') as fout:
+        for pid, row in master_df[master_df["peak_type"] == "human_specific"].iterrows():
+            fout.write(f"{row['Human_chr']}\t{int(row['Human_start'])}\t"
+                       f"{int(row['Human_end'])}\t{pid}\n")
+            n_hs += 1
+
+    # Per-species unified (from filtered liftback)
+    for species in species_list:
+        sp_info = filter_results.get(species, {})
+        filtered_bed = sp_info.get("output_file")
+        sp_out = os.path.join(combined_dir, f"unified_peaks_{species}.bed")
+        n = 0
+        if filtered_bed and os.path.exists(filtered_bed):
+            with open(filtered_bed) as fin, open(sp_out, 'w') as fout:
+                for line in fin:
+                    if line.strip() and not line.startswith('#'):
+                        parts = line.strip().split('\t')
+                        fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n")
+                        n += 1
+        if verbose:
+            print(f"    unified_peaks_{species}.bed: {n:,}")
+
+    # Per-species all_peaks (filtered liftback + species-specific)
+    sp_specific_dir = os.path.join(output_dir, "05_species_specific")
+    for species in species_list:
+        sp_all = os.path.join(combined_dir, f"all_peaks_{species}.bed")
+        n = 0
+        with open(sp_all, 'w') as fout:
+            # Filtered liftback
+            sp_info = filter_results.get(species, {})
+            filtered_bed = sp_info.get("output_file")
+            if filtered_bed and os.path.exists(filtered_bed):
+                with open(filtered_bed) as fin:
+                    for line in fin:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n")
+                            n += 1
+            # Species-specific
+            sp_bed = os.path.join(sp_specific_dir, f"{species}_specific_peaks.bed")
+            if os.path.exists(sp_bed):
+                with open(sp_bed) as fin:
+                    for line in fin:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n")
+                            n += 1
+        if verbose:
+            print(f"    all_peaks_{species}.bed: {n:,}")
+
+    # Human all_peaks
+    human_all = os.path.join(combined_dir, "all_peaks_Human.bed")
+    n_human = 0
+    with open(human_all, 'w') as fout:
+        for pid, row in master_df[
+            master_df["peak_type"].isin(["unified", "human_specific"])
+        ].iterrows():
+            fout.write(f"{row['Human_chr']}\t{int(row['Human_start'])}\t"
+                       f"{int(row['Human_end'])}\t{pid}\n")
+            n_human += 1
+    if verbose:
+        print(f"    all_peaks_Human.bed: {n_human:,}")
+
+    if verbose:
+        print(f"\n  unified_peaks_hg38.bed:        {n_uni:,}")
+        print(f"  human_specific_peaks_hg38.bed: {n_hs:,}")
+        print(f"\n  Done. Use 09_combined_filtered/ for downstream analysis.")
+
+    return {
+        "filter_results": filter_results,
+        "master_df": master_df,
+        "master_file": filtered_master_file,
+        "filter_dir": filter_dir,
+        "combined_dir": combined_dir,
+    }
+
+
+# =============================================================================
+# PEAK RESIZING
+# =============================================================================
+
+def resize_peaks(
+    input_bed: str,
+    output_bed: str,
+    target_size: int = 500,
+    narrowpeak_file: Optional[str] = None,
+    chromsizes_file: Optional[str] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Resize peaks to a uniform fixed width.
+
+    For every region in *input_bed*, determine a centre point and expand
+    symmetrically to *target_size*.  Centre selection priority:
+
+    1. **Summit from overlapping narrowPeak** — if *narrowpeak_file* is
+       supplied and has a summit column (col 10), the summit position of
+       the best-overlapping narrowPeak entry is used.
+    2. **Centre of overlapping narrowPeak** — if the narrowPeak file has
+       no summit column (or summit is -1), the midpoint of the
+       overlapping narrowPeak region is used.
+    3. **Own centre** — if no overlap is found, the midpoint of the
+       input region itself is used.
+
+    Parameters
+    ----------
+    input_bed : str
+        BED file with regions to resize (≥4 columns: chr, start, end, id).
+    output_bed : str
+        Path for output BED file (chr, start, end, id).
+    target_size : int
+        Desired uniform peak width (default 500 bp).
+    narrowpeak_file : str, optional
+        NarrowPeak file (10 columns) or BED file with peak coordinates.
+        Used to find summits or centres for anchoring.
+    chromsizes_file : str, optional
+        Tab-delimited ``chrom<TAB>size`` file.  If provided, peaks are
+        clipped to chromosome boundaries.
+    verbose : bool
+        Print summary statistics.
+
+    Returns
+    -------
+    dict
+        ``{"input": N, "output": N, "summit_anchored": N,
+          "narrowpeak_center_anchored": N, "self_center_anchored": N,
+          "clipped": N, "output_file": path}``
+    """
+    os.makedirs(os.path.dirname(output_bed) or '.', exist_ok=True)
+    half = target_size // 2
+
+    # Load chromsizes if provided
+    chrom_max = {}
+    if chromsizes_file and os.path.exists(chromsizes_file):
+        with open(chromsizes_file) as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    chrom_max[parts[0]] = int(parts[1])
+
+    # Load narrowPeak data if provided
+    np_summits = {}   # (chrom, summit_pos) indexed by interval tree
+    np_entries = []    # list of (chrom, start, end, summit_abs) tuples
+    has_summit_col = False
+
+    if narrowpeak_file and os.path.exists(narrowpeak_file):
+        with open(narrowpeak_file) as f:
+            for line in f:
+                if line.startswith('#') or not line.strip():
+                    continue
+                parts = line.strip().split('\t')
+                chrom = parts[0]
+                start = int(parts[1])
+                end = int(parts[2])
+                # NarrowPeak col 10 (0-indexed 9) is summit offset from start
+                summit_abs = None
+                if len(parts) >= 10:
+                    try:
+                        summit_offset = int(parts[9])
+                        if summit_offset >= 0:
+                            summit_abs = start + summit_offset
+                            has_summit_col = True
+                    except (ValueError, IndexError):
+                        pass
+                np_entries.append((chrom, start, end, summit_abs))
+
+        if verbose:
+            print(f"  NarrowPeak file: {len(np_entries):,} entries"
+                  f" ({'with' if has_summit_col else 'without'} summits)")
+
+    # Build simple interval lookup: chrom -> sorted list of (start, end, summit)
+    np_by_chrom = defaultdict(list)
+    for chrom, start, end, summit in np_entries:
+        np_by_chrom[chrom].append((start, end, summit))
+    for chrom in np_by_chrom:
+        np_by_chrom[chrom].sort()
+
+    def _find_best_overlap(chrom, qstart, qend):
+        """Find the narrowPeak entry with the most overlap."""
+        best_ovl = 0
+        best_entry = None
+        for (s, e, summit) in np_by_chrom.get(chrom, []):
+            if s >= qend:
+                break
+            if e <= qstart:
+                continue
+            ovl = min(qend, e) - max(qstart, s)
+            if ovl > best_ovl:
+                best_ovl = ovl
+                best_entry = (s, e, summit)
+        return best_entry if best_ovl > 0 else None
+
+    # Process peaks
+    n_input = 0
+    n_summit = 0
+    n_np_center = 0
+    n_self_center = 0
+    n_clipped = 0
+
+    with open(input_bed) as fin, open(output_bed, 'w') as fout:
+        for line in fin:
+            if not line.strip() or line.startswith('#'):
+                continue
+            parts = line.strip().split('\t')
+            chrom = parts[0]
+            start = int(parts[1])
+            end = int(parts[2])
+            peak_id = parts[3] if len(parts) > 3 else f"{chrom}:{start}-{end}"
+            n_input += 1
+
+            # Determine centre
+            center = None
+            overlap = _find_best_overlap(chrom, start, end) if np_entries else None
+
+            if overlap is not None:
+                np_s, np_e, np_summit = overlap
+                if np_summit is not None:
+                    center = np_summit
+                    n_summit += 1
+                else:
+                    center = (np_s + np_e) // 2
+                    n_np_center += 1
+            else:
+                center = (start + end) // 2
+                n_self_center += 1
+
+            # Expand around centre
+            new_start = center - half
+            new_end = center + half
+            if target_size % 2 != 0:
+                new_end += 1  # handle odd sizes
+
+            # Clip to chromosome boundaries
+            if new_start < 0:
+                new_start = 0
+                new_end = target_size
+                n_clipped += 1
+            if chrom_max and chrom in chrom_max:
+                cmax = chrom_max[chrom]
+                if new_end > cmax:
+                    new_end = cmax
+                    new_start = max(0, cmax - target_size)
+                    n_clipped += 1
+
+            fout.write(f"{chrom}\t{new_start}\t{new_end}\t{peak_id}\n")
+
+    if verbose:
+        print(f"  Resized {n_input:,} peaks to {target_size} bp:")
+        print(f"    Summit-anchored:        {n_summit:,}")
+        print(f"    NarrowPeak-center:      {n_np_center:,}")
+        print(f"    Self-center:            {n_self_center:,}")
+        if n_clipped:
+            print(f"    Clipped to chrom edge:  {n_clipped:,}")
+
+    return {
+        "input": n_input,
+        "output": n_input,
+        "summit_anchored": n_summit,
+        "narrowpeak_center_anchored": n_np_center,
+        "self_center_anchored": n_self_center,
+        "clipped": n_clipped,
+        "output_file": output_bed,
+    }
+
+
+# =============================================================================
+# RECIPROCAL LIFTOVER CHECK
+# =============================================================================
+
+def reciprocal_liftover_check(
+    hg38_bed: str,
+    liftback_dir: str,
+    output_dir: str,
+    species_list: List[str],
+    chain_dir: str = DEFAULT_CHAIN_DIR,
+    liftover_path: str = "liftOver",
+    min_match: Union[float, Dict[str, float]] = 0.95,
+    min_blocks: Optional[float] = None,
+    multiple: bool = False,
+    max_distance: int = 500,
+    file_pattern: str = "unified_consensus_{species}.bed",
+    verbose: bool = True,
+    ncpu: int = 1,
+) -> Dict[str, Any]:
+    """
+    Verify that unified peaks survive a reciprocal (round-trip) liftover.
+
+    For each NHP species the liftback BED (hg38 → NHP from Step 4) is
+    lifted *back* to hg38 using the **forward** chain (NHP → hg38).  Each
+    peak passes only if the round-trip hg38 coordinates overlap the
+    original hg38 coordinates (or are within *max_distance* bp).
+
+    This catches peaks where the liftover lands in a non-orthologous
+    location (e.g. a paralogous repeat on a different chromosome or
+    a far-away region on the same chromosome).
+
+    For every species, writes:
+      - ``{species}_reciprocal_pass.bed``  — peaks that survive round-trip
+      - ``{species}_reciprocal_fail.bed``  — peaks that fail
+
+    Parameters
+    ----------
+    hg38_bed : str
+        Original unified peaks in hg38 (chr, start, end, peak_id).
+    liftback_dir : str
+        Directory with liftback BED files (``unified_consensus_{species}.bed``).
+    output_dir : str
+        Directory for reciprocal-check output.
+    species_list : list of str
+        NHP species to check.
+    chain_dir : str
+        Directory containing chain files.
+    liftover_path : str
+        Path to UCSC ``liftOver`` executable.
+    min_match : float or dict
+        Minimum match ratio for the reciprocal liftover.
+    min_blocks : float, optional
+        Minimum block ratio.
+    multiple : bool
+        Allow multiple mappings (default False).
+    max_distance : int
+        Maximum distance (bp) between original and round-trip start
+        positions to consider a pass (default 500).
+    file_pattern : str
+        Filename pattern with ``{species}`` placeholder for liftback BEDs
+        (default ``unified_consensus_{species}.bed``).
+    verbose : bool
+        Print per-species statistics.
+    ncpu : int
+        Parallel workers for liftover.
+
+    Returns
+    -------
+    dict
+        ``{species: {"input": N, "passed": N, "failed": N, "unmapped": N,
+                     "pass_file": path, "fail_file": path}}``
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    def _get_mm(species):
+        if isinstance(min_match, dict):
+            return min_match.get(species, 0.95)
+        return min_match
+
+    # Load original hg38 coordinates: peak_id -> (chr, start, end)
+    hg38_coords = {}
+    with open(hg38_bed) as f:
+        for line in f:
+            if line.strip() and not line.startswith('#'):
+                parts = line.strip().split('\t')
+                hg38_coords[parts[3]] = (parts[0], int(parts[1]), int(parts[2]))
+
+    results = {}
+
+    if verbose:
+        print(f"\nReciprocal liftover check (max_distance={max_distance} bp)")
+        print(f"  Original hg38 peaks: {len(hg38_coords):,}")
+        print(f"  {'Species':<15s} {'Input':>8s} {'Lifted':>8s} "
+              f"{'Pass':>8s} {'Fail':>8s} {'Unmap':>8s} {'%Pass':>8s}")
+        print("  " + "-" * 65)
+
+    for species in species_list:
+        lb_file = os.path.join(liftback_dir,
+                               file_pattern.format(species=species))
+        if not os.path.exists(lb_file):
+            if verbose:
+                print(f"  {species:<15s} (liftback file not found, skipping)")
+            continue
+
+        # Clean the liftback to BED4 (in case it has extra columns)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lb_bed4 = os.path.join(tmpdir, "liftback_bed4.bed")
+            n_input = 0
+            with open(lb_file) as fin, open(lb_bed4, 'w') as fout:
+                for line in fin:
+                    if line.strip() and not line.startswith('#'):
+                        parts = line.strip().split('\t')
+                        fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n")
+                        n_input += 1
+
+            # Lift NHP coords back to hg38 using forward chain
+            round_trip_bed = os.path.join(tmpdir, "round_trip_hg38.bed")
+
+            if species == "Marmoset":
+                # Reverse of the 2-step: calJac1 → calJac4 → hg38
+                chain1 = get_chain_file("Marmoset_step1", chain_dir)  # calJac1→calJac4
+                chain2 = get_chain_file("Marmoset_step2", chain_dir)  # calJac4→hg38
+                liftover_two_step(
+                    input_bed=lb_bed4, output_bed=round_trip_bed,
+                    chain_file_1=chain1, chain_file_2=chain2,
+                    liftover_path=liftover_path,
+                    min_match=_get_mm(species),
+                    min_blocks=min_blocks, multiple=multiple,
+                    auto_chr=True, verbose=False, ncpu=ncpu,
+                )
+            else:
+                chain_fwd = get_chain_file(species, chain_dir)  # NHP → hg38
+                liftover_peaks(
+                    input_bed=lb_bed4, output_bed=round_trip_bed,
+                    chain_file=chain_fwd, liftover_path=liftover_path,
+                    min_match=_get_mm(species),
+                    min_blocks=min_blocks, multiple=multiple,
+                    auto_chr=True, verbose=False, ncpu=ncpu,
+                )
+
+            # Read round-trip hg38 coordinates
+            rt_coords = {}  # peak_id -> (chr, start, end)
+            if os.path.exists(round_trip_bed):
+                with open(round_trip_bed) as f:
+                    for line in f:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            rt_coords[parts[3]] = (parts[0], int(parts[1]), int(parts[2]))
+
+        # Compare original vs round-trip
+        pass_file = os.path.join(output_dir, f"{species}_reciprocal_pass.bed")
+        fail_file = os.path.join(output_dir, f"{species}_reciprocal_fail.bed")
+
+        n_pass = n_fail = n_unmapped = 0
+
+        # Also read original liftback coords for writing pass/fail in NHP coords
+        lb_peaks = {}  # peak_id -> original liftback line (BED4)
+        with open(lb_file) as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    parts = line.strip().split('\t')
+                    lb_peaks[parts[3]] = f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n"
+
+        with open(pass_file, 'w') as fp, open(fail_file, 'w') as ff:
+            for peak_id, lb_line in lb_peaks.items():
+                if peak_id not in rt_coords:
+                    ff.write(lb_line)
+                    n_unmapped += 1
+                    continue
+
+                orig = hg38_coords.get(peak_id)
+                if orig is None:
+                    ff.write(lb_line)
+                    n_fail += 1
+                    continue
+
+                rt_chr, rt_start, rt_end = rt_coords[peak_id]
+                orig_chr, orig_start, orig_end = orig
+
+                # Check: same chromosome and overlapping or within max_distance
+                if (rt_chr == orig_chr and
+                        rt_start <= orig_end + max_distance and
+                        rt_end >= orig_start - max_distance):
+                    fp.write(lb_line)
+                    n_pass += 1
+                else:
+                    ff.write(lb_line)
+                    n_fail += 1
+
+        pct = (n_pass / n_input * 100) if n_input > 0 else 0
+        results[species] = {
+            "input": n_input,
+            "passed": n_pass,
+            "failed": n_fail,
+            "unmapped": n_unmapped,
+            "pass_file": pass_file,
+            "fail_file": fail_file,
+        }
+
+        if verbose:
+            print(f"  {species:<15s} {n_input:>8,} {n_pass + n_fail + n_unmapped:>8,} "
+                  f"{n_pass:>8,} {n_fail:>8,} {n_unmapped:>8,} {pct:>7.1f}%")
+
+    return results
+
+
+# =============================================================================
+# FINALIZE PEAK SETS (reciprocal + size filter + resize)
+# =============================================================================
+
+def finalize_peak_sets(
+    output_dir: str,
+    species_list: List[str],
+    target_size: int = 500,
+    narrowpeak_files: Optional[Dict[str, str]] = None,
+    chromsizes_files: Optional[Dict[str, str]] = None,
+    min_liftback_size: int = 100,
+    max_liftback_size: int = 5000,
+    reciprocal_check: bool = True,
+    chain_dir: str = DEFAULT_CHAIN_DIR,
+    liftover_path: str = "liftOver",
+    min_match: Union[float, Dict[str, float]] = 0.95,
+    max_distance: int = 500,
+    ncpu: int = 1,
+    species_beds: Optional[Dict[str, str]] = None,
+    human_bed: Optional[str] = None,
+    liftback_subdir: str = "04_lifted_back",
+    master_subdir: str = "07_master_annotation",
+    merged_subdir: str = "02_merged_consensus",
+    species_specific_subdir: str = "05_species_specific",
+    final_subdir: str = "10_final",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Complete post-pipeline finalization: reciprocal check → size filter →
+    resize → write final uniform-width BED files.
+
+    This is designed to run on existing pipeline output **without**
+    re-running the full pipeline.
+
+    Processing order for unified peaks per species
+    -----------------------------------------------
+    1. **Size filter** — discard liftback peaks outside
+       ``[min_liftback_size, max_liftback_size]``.
+    2. **Reciprocal liftover check** — lift NHP coords back to hg38 and
+       verify overlap with original hg38 coords.
+    3. **Update master annotation** — recalculate ``n_species_orth`` and
+       reclassify unified → human_specific where needed.
+    4. **Resize** — expand/shrink every surviving peak to *target_size*
+       using summit info from *narrowpeak_files*.
+
+    Output in ``{output_dir}/{final_subdir}/``
+    -------------------------------------------
+    - ``all_peaks_{Species}.bed``  — unified + species-specific, all
+      same *target_size* width
+    - ``unified_peaks_hg38.bed``   — unified peaks in hg38
+    - ``unified_peaks_{Species}.bed`` — unified peaks in species coords
+    - ``human_specific_peaks_hg38.bed``
+    - ``loss_summary.tsv``         — per-species, per-step peak counts
+    - ``{species}_rescued_peaks.bed`` — original peaks lost during
+      filtering, rescued back into the final set
+    - Intermediate files in ``{final_subdir}/intermediates/``
+
+    Parameters
+    ----------
+    output_dir : str
+        Top-level pipeline output directory.
+    species_list : list of str
+        NHP species names.
+    target_size : int
+        Uniform peak width for final output (default 500 bp).
+    narrowpeak_files : dict, optional
+        ``{species: path}`` with species narrowPeak / peak files for
+        summit-based centring.  Key ``"Human"`` for human peaks.
+    chromsizes_files : dict, optional
+        ``{species: path}`` to chrom.sizes files for boundary clipping.
+    min_liftback_size : int
+        Minimum liftback peak size (default 100).
+    max_liftback_size : int
+        Maximum liftback peak size (default 5000).
+    chain_dir : str
+        Chain file directory.
+    liftover_path : str
+        Path to ``liftOver`` executable.
+    min_match : float or dict
+        Min match ratio for reciprocal liftover.
+    max_distance : int
+        Max distance (bp) for reciprocal overlap test (default 500).
+    ncpu : int
+        Parallel workers.
+    species_beds : dict, optional
+        ``{species: path}`` mapping NHP species name to its original
+        consensus peaks BED file.  When provided a rescue step (Step F)
+        compares final output with original input and re-adds any peaks
+        that were lost during filtering, labelled
+        ``{species}_rescued_NNNNNN``.
+    human_bed : str, optional
+        Path to the original human consensus peaks BED file.
+        Used together with *species_beds* for the rescue step.
+    liftback_subdir, master_subdir, merged_subdir,
+    species_specific_subdir, final_subdir : str
+        Subdirectory names within *output_dir*.
+    verbose : bool
+        Print progress and loss summaries.
+
+    Returns
+    -------
+    dict
+        ``{"loss_summary": DataFrame, "master_df": DataFrame,
+          "final_dir": path, ...}``
+    """
+    liftback_dir = os.path.join(output_dir, liftback_subdir)
+    master_file = os.path.join(output_dir, master_subdir, "master_annotation.tsv")
+    merged_bed = os.path.join(output_dir, merged_subdir,
+                              "unified_consensus_hg38_bed4.bed")
+    # Fallback if bed4 doesn't exist
+    if not os.path.exists(merged_bed):
+        merged_bed = os.path.join(output_dir, merged_subdir,
+                                  "unified_consensus_hg38_with_ids.bed")
+    sp_specific_dir = os.path.join(output_dir, species_specific_subdir)
+    final_dir = os.path.join(output_dir, final_subdir)
+    intermediates = os.path.join(final_dir, "intermediates")
+    os.makedirs(intermediates, exist_ok=True)
+
+    if narrowpeak_files is None:
+        narrowpeak_files = {}
+    if chromsizes_files is None:
+        chromsizes_files = {}
+
+    loss_rows = []  # for loss_summary.tsv
+
+    if verbose:
+        print("=" * 70)
+        print("FINALIZE PEAK SETS")
+        print(f"  target_size = {target_size} bp")
+        print(f"  size filter = [{min_liftback_size}, {max_liftback_size}] bp")
+        print(f"  reciprocal max_distance = {max_distance} bp")
+        print("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Load original hg38 peak counts (before any filtering)
+    # ------------------------------------------------------------------
+    hg38_bed = merged_bed
+    # Prepare a clean BED4 from the merged file for reciprocal check
+    hg38_bed4 = os.path.join(intermediates, "unified_hg38_bed4.bed")
+    n_hg38_total = 0
+    with open(hg38_bed) as fin, open(hg38_bed4, 'w') as fout:
+        for line in fin:
+            if line.strip() and not line.startswith('#'):
+                parts = line.strip().split('\t')
+                fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\t{parts[3]}\n")
+                n_hg38_total += 1
+
+    if verbose:
+        print(f"\n  Total unified hg38 peaks (input): {n_hg38_total:,}")
+
+    # ------------------------------------------------------------------
+    # STEP A: Size-filter liftback BEDs
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"\n--- Step A: Size filter [{min_liftback_size:,}–"
+              f"{max_liftback_size:,} bp] ---")
+
+    size_filter_dir = os.path.join(intermediates, "size_filtered")
+    size_results = filter_liftback_by_size(
+        liftback_dir=liftback_dir,
+        output_dir=size_filter_dir,
+        species_list=species_list,
+        min_liftback_size=min_liftback_size,
+        max_liftback_size=max_liftback_size,
+        verbose=verbose,
+    )
+
+    for species, info in size_results.items():
+        loss_rows.append({
+            "species": species, "step": "A_size_filter",
+            "input": info["input"], "kept": info["kept"],
+            "removed": info["rejected"],
+        })
+
+    # ------------------------------------------------------------------
+    # STEP B: Reciprocal liftover check (on size-filtered liftback)
+    # ------------------------------------------------------------------
+    reciprocal_results = {}
+    if reciprocal_check:
+        if verbose:
+            print(f"\n--- Step B: Reciprocal liftover check ---")
+
+        reciprocal_dir = os.path.join(intermediates, "reciprocal")
+        reciprocal_results = reciprocal_liftover_check(
+            hg38_bed=hg38_bed4,
+            liftback_dir=size_filter_dir,
+            output_dir=reciprocal_dir,
+            species_list=species_list,
+            chain_dir=chain_dir,
+            liftover_path=liftover_path,
+            min_match=min_match,
+            max_distance=max_distance,
+            file_pattern="unified_consensus_{species}_filtered.bed",
+            verbose=verbose,
+            ncpu=ncpu,
+        )
+
+        for species, info in reciprocal_results.items():
+            loss_rows.append({
+                "species": species, "step": "B_reciprocal_check",
+                "input": info["input"],
+                "kept": info["passed"],
+                "removed": info["failed"] + info["unmapped"],
+            })
+    else:
+        if verbose:
+            print(f"\n--- Step B: Reciprocal liftover check (SKIPPED) ---")
+
+    # ------------------------------------------------------------------
+    # STEP C: Update master annotation with combined filtering
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"\n--- Step C: Update master annotation ---")
+
+    master_df = pd.read_csv(master_file, sep="\t", index_col="peak_id")
+    original_types = master_df["peak_type"].value_counts().to_dict()
+
+    # Collect peak IDs that PASSED all filters per species
+    passed_ids = {}
+    if reciprocal_check:
+        # Use reciprocal pass files
+        for species, info in reciprocal_results.items():
+            pf = info.get("pass_file")
+            if pf and os.path.exists(pf):
+                ids = set()
+                with open(pf) as f:
+                    for line in f:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 4:
+                                ids.add(parts[3])
+                passed_ids[species] = ids
+    else:
+        # Use size-filtered files (no reciprocal check)
+        for species, info in size_results.items():
+            sf = info.get("output_file")
+            if sf and os.path.exists(sf):
+                ids = set()
+                with open(sf) as f:
+                    for line in f:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 4:
+                                ids.add(parts[3])
+                passed_ids[species] = ids
+
+    # Clear orthology for peaks that did NOT pass
+    for species in species_list:
+        orth_col = f"{species}_orth"
+        chr_col = f"{species}_chr"
+        start_col = f"{species}_start"
+        end_col = f"{species}_end"
+
+        if orth_col not in master_df.columns:
+            continue
+
+        # Peaks that currently have orth=1 but didn't pass
+        sp_passed = passed_ids.get(species, set())
+        currently_orth = master_df.index[master_df[orth_col] == 1]
+        failed = set(currently_orth) - sp_passed
+
+        if failed:
+            mask = master_df.index.isin(failed)
+            master_df.loc[mask, orth_col] = 0
+            for col in [chr_col, start_col, end_col]:
+                if col in master_df.columns:
+                    master_df.loc[mask, col] = np.nan
+
+            if verbose:
+                print(f"  {species}: cleared orthology for "
+                      f"{len(failed):,} peaks (size + reciprocal filter)")
+
+    # Recalculate n_species_orth
+    orth_cols = [c for c in master_df.columns if c.endswith("_orth")]
+    master_df["n_species_orth"] = master_df[orth_cols].sum(axis=1)
+
+    # Reclassify
+    mask_reclassify = (
+        (master_df["peak_type"] == "unified") &
+        (master_df["n_species_orth"] == 1)
+    )
+    n_reclassified = mask_reclassify.sum()
+    master_df.loc[mask_reclassify, "peak_type"] = "human_specific"
+
+    # Reassign IDs for newly reclassified peaks
+    if n_reclassified > 0:
+        existing_hs = [idx for idx in master_df.index
+                       if idx.startswith("human_peak_")]
+        max_hs_num = (max(int(idx.split("_")[-1]) for idx in existing_hs)
+                      if existing_hs else 0)
+        new_mapping = {}
+        counter = max_hs_num
+        for idx in master_df.index[mask_reclassify]:
+            if not idx.startswith("human_peak_"):
+                counter += 1
+                new_mapping[idx] = f"human_peak_{counter:06d}"
+        if new_mapping:
+            master_df = master_df.rename(index=new_mapping)
+            # Update passed_ids with new names so downstream is consistent
+            reverse_map = {v: k for k, v in new_mapping.items()}
+            for species in passed_ids:
+                passed_ids[species] = {
+                    new_mapping.get(pid, pid) for pid in passed_ids[species]
+                }
+
+    new_types = master_df["peak_type"].value_counts().to_dict()
+    if verbose:
+        print(f"\n  Peak types before: {original_types}")
+        print(f"  Peak types after:  {new_types}")
+        if n_reclassified:
+            print(f"  Reclassified {n_reclassified:,} unified → human_specific")
+
+    # Save updated master
+    master_out = os.path.join(final_dir, "master_annotation_final.tsv")
+    master_df.to_csv(master_out, sep="\t")
+
+    loss_rows.append({
+        "species": "ALL", "step": "C_reclassify",
+        "input": sum(original_types.values()),
+        "kept": sum(new_types.values()),
+        "removed": n_reclassified,
+    })
+
+    # ------------------------------------------------------------------
+    # STEP D: Write filtered BEDs, then resize to uniform width
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"\n--- Step D: Resize all peaks to {target_size} bp ---")
+
+    # D1. Unified peaks hg38 (before resize, for reference)
+    uni_hg38_pre = os.path.join(intermediates, "unified_peaks_hg38_pre_resize.bed")
+    n_uni = 0
+    with open(uni_hg38_pre, 'w') as fout:
+        for pid, row in master_df[master_df["peak_type"] == "unified"].iterrows():
+            fout.write(f"{row['Human_chr']}\t{int(row['Human_start'])}\t"
+                       f"{int(row['Human_end'])}\t{pid}\n")
+            n_uni += 1
+
+    # D2. Human-specific peaks (before resize)
+    hs_hg38_pre = os.path.join(intermediates, "human_specific_hg38_pre_resize.bed")
+    n_hs = 0
+    with open(hs_hg38_pre, 'w') as fout:
+        for pid, row in master_df[master_df["peak_type"] == "human_specific"].iterrows():
+            fout.write(f"{row['Human_chr']}\t{int(row['Human_start'])}\t"
+                       f"{int(row['Human_end'])}\t{pid}\n")
+            n_hs += 1
+
+    # D3. Per-species unified (from reciprocal pass or size-filtered, before resize)
+    sp_uni_pre = {}
+    for species in species_list:
+        if reciprocal_check:
+            info = reciprocal_results.get(species, {})
+            pf = info.get("pass_file")
+            if pf and os.path.exists(pf):
+                sp_uni_pre[species] = pf
+        else:
+            info = size_results.get(species, {})
+            sf = info.get("output_file")
+            if sf and os.path.exists(sf):
+                sp_uni_pre[species] = sf
+
+    # D4. Per-species species-specific (before resize)
+    sp_specific_pre = {}
+    for species in species_list:
+        sp_bed = os.path.join(sp_specific_dir, f"{species}_specific_peaks.bed")
+        if os.path.exists(sp_bed):
+            sp_specific_pre[species] = sp_bed
+
+    # --- Resize everything ---
+    # Human unified + human_specific (hg38)
+    human_np = narrowpeak_files.get("Human")
+    human_cs = chromsizes_files.get("Human")
+
+    resize_results = {}
+
+    # Unified hg38
+    uni_hg38_final = os.path.join(final_dir, "unified_peaks_hg38.bed")
+    if verbose:
+        print(f"\n  Resizing unified hg38 ({n_uni:,} peaks):")
+    resize_results["unified_hg38"] = resize_peaks(
+        uni_hg38_pre, uni_hg38_final, target_size,
+        narrowpeak_file=human_np, chromsizes_file=human_cs,
+        verbose=verbose,
+    )
+
+    # Human-specific hg38
+    hs_hg38_final = os.path.join(final_dir, "human_specific_peaks_hg38.bed")
+    if verbose:
+        print(f"\n  Resizing human-specific hg38 ({n_hs:,} peaks):")
+    resize_results["hs_hg38"] = resize_peaks(
+        hs_hg38_pre, hs_hg38_final, target_size,
+        narrowpeak_file=human_np, chromsizes_file=human_cs,
+        verbose=verbose,
+    )
+
+    # Per-species unified (NHP coords)
+    for species, pf in sp_uni_pre.items():
+        sp_final = os.path.join(final_dir, f"unified_peaks_{species}.bed")
+        sp_np = narrowpeak_files.get(species)
+        sp_cs = chromsizes_files.get(species)
+        if verbose:
+            print(f"\n  Resizing unified {species}:")
+        resize_results[f"unified_{species}"] = resize_peaks(
+            pf, sp_final, target_size,
+            narrowpeak_file=sp_np, chromsizes_file=sp_cs,
+            verbose=verbose,
+        )
+
+    # Per-species species-specific
+    for species, sp_bed in sp_specific_pre.items():
+        sp_final = os.path.join(final_dir, f"{species}_specific_peaks.bed")
+        sp_np = narrowpeak_files.get(species)
+        sp_cs = chromsizes_files.get(species)
+        if verbose:
+            print(f"\n  Resizing {species}-specific:")
+        resize_results[f"specific_{species}"] = resize_peaks(
+            sp_bed, sp_final, target_size,
+            narrowpeak_file=sp_np, chromsizes_file=sp_cs,
+            verbose=verbose,
+        )
+
+    # ------------------------------------------------------------------
+    # STEP E: Combine into final all_peaks BEDs per species
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"\n--- Step E: Write final all_peaks BEDs ---")
+
+    # Human: unified + human_specific
+    human_all = os.path.join(final_dir, "all_peaks_Human.bed")
+    n_human = 0
+    with open(human_all, 'w') as fout:
+        for src in [uni_hg38_final, hs_hg38_final]:
+            if os.path.exists(src):
+                with open(src) as fin:
+                    for line in fin:
+                        if line.strip():
+                            fout.write(line)
+                            n_human += 1
+    if verbose:
+        print(f"  all_peaks_Human.bed: {n_human:,}")
+
+    # NHP: unified + species-specific
+    for species in species_list:
+        sp_all = os.path.join(final_dir, f"all_peaks_{species}.bed")
+        n = 0
+        with open(sp_all, 'w') as fout:
+            uni_f = os.path.join(final_dir, f"unified_peaks_{species}.bed")
+            if os.path.exists(uni_f):
+                with open(uni_f) as fin:
+                    for line in fin:
+                        if line.strip():
+                            fout.write(line)
+                            n += 1
+            spc_f = os.path.join(final_dir, f"{species}_specific_peaks.bed")
+            if os.path.exists(spc_f):
+                with open(spc_f) as fin:
+                    for line in fin:
+                        if line.strip():
+                            fout.write(line)
+                            n += 1
+        if verbose:
+            print(f"  all_peaks_{species}.bed: {n:,}")
+
+    # ------------------------------------------------------------------
+    # STEP F: Rescue missing peaks from original input
+    # ------------------------------------------------------------------
+    rescued_counts = {}
+    if species_beds or human_bed:
+        if verbose:
+            print(f"\n--- Step F: Rescue peaks lost during filtering ---")
+
+        # Build dict of all original inputs and all final outputs
+        original_beds = {}  # species -> original input BED
+        final_beds = {}     # species -> final all_peaks BED
+
+        if human_bed and os.path.exists(human_bed):
+            original_beds["Human"] = human_bed
+            final_beds["Human"] = os.path.join(final_dir, "all_peaks_Human.bed")
+
+        if species_beds:
+            for sp, bed in species_beds.items():
+                if os.path.exists(bed):
+                    original_beds[sp] = bed
+                    final_beds[sp] = os.path.join(final_dir, f"all_peaks_{sp}.bed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for sp in original_beds:
+                orig = original_beds[sp]
+                final = final_beds.get(sp)
+                if not final or not os.path.exists(final):
+                    continue
+
+                # Extract BED3 from original and sort
+                orig_bed3 = os.path.join(tmpdir, f"{sp}_orig_bed3.bed")
+                with open(orig) as fin, open(orig_bed3, 'w') as fout:
+                    for line in fin:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+
+                orig_sorted = os.path.join(tmpdir, f"{sp}_orig_sorted.bed")
+                subprocess.run(
+                    f"sort -k1,1 -k2,2n {orig_bed3} > {orig_sorted}",
+                    shell=True, check=True,
+                )
+
+                # Extract BED3 from final and sort/merge
+                final_bed3 = os.path.join(tmpdir, f"{sp}_final_bed3.bed")
+                with open(final) as fin, open(final_bed3, 'w') as fout:
+                    for line in fin:
+                        if line.strip() and not line.startswith('#'):
+                            parts = line.strip().split('\t')
+                            fout.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+
+                final_sorted = os.path.join(tmpdir, f"{sp}_final_sorted.bed")
+                final_merged = os.path.join(tmpdir, f"{sp}_final_merged.bed")
+                subprocess.run(
+                    f"sort -k1,1 -k2,2n {final_bed3} > {final_sorted}",
+                    shell=True, check=True,
+                )
+                subprocess.run(
+                    f"bedtools merge -i {final_sorted} > {final_merged}",
+                    shell=True, check=True,
+                )
+
+                # Find original peaks NOT overlapping any final peak
+                missing_raw = os.path.join(tmpdir, f"{sp}_missing.bed")
+                subprocess.run(
+                    f"bedtools intersect -v -a {orig_sorted} -b {final_merged} > {missing_raw}",
+                    shell=True, check=True,
+                )
+
+                n_missing = sum(1 for line in open(missing_raw) if line.strip())
+                if n_missing == 0:
+                    if verbose:
+                        print(f"  {sp}: no missing peaks — nothing to rescue")
+                    rescued_counts[sp] = 0
+                    continue
+
+                # Resize rescued peaks to target_size and assign IDs
+                sp_lower = sp.lower()
+                rescued_bed = os.path.join(final_dir, f"{sp}_rescued_peaks.bed")
+                sp_cs = chromsizes_files.get(sp)
+                cs_lookup = {}
+                if sp_cs and os.path.exists(sp_cs):
+                    with open(sp_cs) as f:
+                        for line in f:
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 2:
+                                cs_lookup[parts[0]] = int(parts[1])
+
+                with open(missing_raw) as fin, open(rescued_bed, 'w') as fout:
+                    for i, line in enumerate(fin, 1):
+                        parts = line.strip().split('\t')
+                        chrom = parts[0]
+                        start = int(parts[1])
+                        end = int(parts[2])
+                        mid = (start + end) // 2
+                        new_start = max(0, mid - target_size // 2)
+                        new_end = new_start + target_size
+                        # Clip to chromosome bounds
+                        if chrom in cs_lookup:
+                            if new_end > cs_lookup[chrom]:
+                                new_end = cs_lookup[chrom]
+                                new_start = max(0, new_end - target_size)
+                        peak_id = f"{sp_lower}_rescued_{i:06d}"
+                        fout.write(f"{chrom}\t{new_start}\t{new_end}\t{peak_id}\n")
+
+                # Append rescued peaks to the all_peaks file
+                with open(final, 'a') as fout:
+                    with open(rescued_bed) as fin:
+                        for line in fin:
+                            if line.strip():
+                                fout.write(line)
+
+                rescued_counts[sp] = n_missing
+                loss_rows.append({
+                    "species": sp, "step": "F_rescued",
+                    "input": n_missing, "kept": n_missing,
+                    "removed": 0,
+                })
+
+                if verbose:
+                    with open(final) as f:
+                        n_final_total = sum(1 for l in f if l.strip())
+                    print(f"  {sp}: rescued {n_missing:,} peaks "
+                          f"(all_peaks now {n_final_total:,})")
+
+    # ------------------------------------------------------------------
+    # Loss summary
+    # ------------------------------------------------------------------
+    loss_df = pd.DataFrame(loss_rows)
+    loss_file = os.path.join(final_dir, "loss_summary.tsv")
+    loss_df.to_csv(loss_file, sep="\t", index=False)
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("LOSS SUMMARY")
+        print("=" * 70)
+        print(loss_df.to_string(index=False))
+        print(f"\n  Saved: {loss_file}")
+        print(f"  Final BEDs in: {final_dir}")
+        print(f"  Master annotation: {master_out}")
+
+    return {
+        "loss_summary": loss_df,
+        "master_df": master_df,
+        "master_file": master_out,
+        "final_dir": final_dir,
+        "size_filter_results": size_results,
+        "reciprocal_results": reciprocal_results,
+        "resize_results": resize_results,
+        "rescued_counts": rescued_counts,
+    }
 
 
 # =============================================================================
@@ -2333,7 +3769,18 @@ def merge_bed_files(
     merge_distance: int = 0,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Legacy simple merge without species tracking."""
+    """Legacy simple merge without species tracking.
+
+    .. deprecated::
+        Use ``merge_with_species_tracking()`` or ``summit_based_merge()``
+        instead.  Kept for backwards compatibility only.
+    """
+    import warnings
+    warnings.warn(
+        "merge_bed_files() is deprecated. Use merge_with_species_tracking() "
+        "or summit_based_merge() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     if verbose:
         print(f"Merging {len(input_beds)} BED files...")
 
@@ -2392,6 +3839,11 @@ def cross_species_consensus_pipeline(
     score_col: int = 4,
     normalize_scores: bool = True,
     peak_prefix: str = "temp",
+    max_liftback_size: Optional[int] = None,
+    min_liftback_size: Optional[int] = None,
+    reciprocal_check: bool = False,
+    max_reciprocal_distance: int = 500,
+    compute_conservation: bool = False,
     gtf_files: Optional[Dict[str, str]] = None,
     pre_lifted_beds: Optional[Dict[str, str]] = None,
     verbose: bool = True,
@@ -2405,6 +3857,9 @@ def cross_species_consensus_pipeline(
     2. Merge lifted peaks + human peaks (assigned temp IDs)
     3. (skipped — human-specific classification via orthology in Step 7)
     4. Liftover temp consensus peaks back to each species
+       - 4b. (optional) Size-filter liftback peaks
+       - 4c. (optional) Reciprocal liftover check
+       - 4d. (optional) Per-peak liftover conservation scoring
     5. Identify species-specific peaks for each non-human species
     6. Annotate all peaks with closest gene
     7. Build master annotation — reclassify peaks using orthology:
@@ -2441,6 +3896,20 @@ def cross_species_consensus_pipeline(
         peak_prefix: Prefix for temporary peak IDs used in intermediate
             files.  Final IDs (``unified_NNNNNN``, ``human_peak_NNNNNN``) are
             assigned in Step 7 after orthology-based classification.
+        max_liftback_size: If set, discard liftback peaks larger than this
+            (bp) after Step 4.  Recommended: 2000–5000.  *None* = no filter.
+        min_liftback_size: If set, discard liftback peaks smaller than this
+            (bp) after Step 4.  Recommended: 100.  *None* = no filter.
+        reciprocal_check: If True, run a reciprocal liftover check
+            (Step 4c) — lift NHP liftback coords back to hg38 and only
+            keep peaks that overlap the original hg38 position.
+        max_reciprocal_distance: Max distance (bp) between original and
+            round-trip hg38 positions for a peak to pass the reciprocal
+            check (default 500).
+        compute_conservation: If True, run per-peak liftover conservation
+            scoring (Step 4d) — round-trip liftover hg38 → species → hg38
+            measuring match_ratio (fraction of bases recovered). Results
+            are saved to ``10_similarity/`` and attached to ``results``.
         gtf_files: Dict mapping species name to GTF file path (optional)
         pre_lifted_beds: Optional dict mapping species name to path of
             pre-computed liftover BED files (already in hg38 coords).
@@ -2658,6 +4127,135 @@ def cross_species_consensus_pipeline(
         results["output_files"][f"liftback_{species}"] = output_bed
 
     # =========================================================================
+    # STEP 4b: (optional) Filter liftback peaks by size
+    # =========================================================================
+    if max_liftback_size is not None or min_liftback_size is not None:
+        _min = min_liftback_size if min_liftback_size is not None else 0
+        _max = max_liftback_size if max_liftback_size is not None else 999_999_999
+        print("\n" + "=" * 70)
+        print(f"STEP 4b: Filter liftback peaks by size [{_min:,} – {_max:,} bp]")
+        print("-" * 50)
+
+        filter_dir = os.path.join(output_dir, "04_lifted_back_filtered")
+        filter_results = filter_liftback_by_size(
+            liftback_dir=lift_back_dir,
+            output_dir=filter_dir,
+            species_list=list(species_beds.keys()),
+            min_liftback_size=_min,
+            max_liftback_size=_max,
+            verbose=verbose,
+        )
+        results["liftback_filter"] = filter_results
+
+        # Update liftback output paths to use filtered files
+        for species, info in filter_results.items():
+            filtered_bed = info.get("output_file")
+            if filtered_bed and os.path.exists(filtered_bed):
+                results["output_files"][f"liftback_{species}"] = filtered_bed
+                # Overwrite original liftback dir file so downstream steps
+                # (species_specific, annotation, master) use filtered coords
+                import shutil
+                dst = os.path.join(lift_back_dir, f"unified_consensus_{species}.bed")
+                shutil.copy2(filtered_bed, dst)
+
+    # =========================================================================
+    # STEP 4c: (optional) Reciprocal liftover check
+    # =========================================================================
+    if reciprocal_check:
+        print("\n" + "=" * 70)
+        print(f"STEP 4c: Reciprocal liftover check (max_distance={max_reciprocal_distance} bp)")
+        print("-" * 50)
+
+        reciprocal_dir = os.path.join(output_dir, "04_reciprocal_check")
+        reciprocal_results = reciprocal_liftover_check(
+            hg38_bed=unified_bed4,
+            liftback_dir=lift_back_dir,
+            output_dir=reciprocal_dir,
+            species_list=list(species_beds.keys()),
+            chain_dir=chain_dir,
+            liftover_path=liftover_path,
+            min_match=min_match,
+            max_distance=max_reciprocal_distance,
+            verbose=verbose,
+            ncpu=ncpu,
+        )
+        results["reciprocal_check"] = reciprocal_results
+
+        # Overwrite liftback files with reciprocal-pass peaks only
+        for species, info in reciprocal_results.items():
+            pass_file = info.get("pass_file")
+            if pass_file and os.path.exists(pass_file):
+                dst = os.path.join(lift_back_dir,
+                                   f"unified_consensus_{species}.bed")
+                shutil.copy2(pass_file, dst)
+                results["output_files"][f"liftback_{species}"] = dst
+
+    # =========================================================================
+    # STEP 4d: (optional) Per-peak liftover conservation scoring
+    # =========================================================================
+    if compute_conservation:
+        print("\n" + "=" * 70)
+        print("STEP 4d: Per-peak liftover conservation scoring (round-trip match ratio)")
+        print("-" * 50)
+
+        similarity_dir = os.path.join(output_dir, "10_similarity")
+        os.makedirs(similarity_dir, exist_ok=True)
+        similarity_tsv = os.path.join(similarity_dir,
+                                      "liftover_similarity_all_species.tsv")
+
+        similarity_df = compute_species_similarity(
+            input_bed=unified_bed4,
+            species_list=list(species_beds.keys()),
+            chain_dir=chain_dir,
+            liftover_path=liftover_path,
+            output_tsv=similarity_tsv,
+            verbose=verbose,
+            ncpu=ncpu,
+        )
+
+        # Pivot to a peak × species match-ratio matrix
+        match_matrix = similarity_df.pivot(
+            index="peak_id", columns="species", values="match_ratio"
+        )
+        match_matrix["Human"] = 1.0
+        col_order = ["Human"] + [s for s in ["Chimpanzee", "Bonobo",
+                     "Gorilla", "Macaque", "Marmoset"]
+                     if s in match_matrix.columns]
+        match_matrix = match_matrix[
+            [c for c in col_order if c in match_matrix.columns]
+        ]
+
+        # Attach coordinates
+        first_sp = similarity_df["species"].iloc[0]
+        coords = similarity_df[similarity_df["species"] == first_sp][
+            ["peak_id", "chrom", "start", "end", "original_size"]
+        ].set_index("peak_id")
+        match_matrix = coords.join(match_matrix)
+
+        matrix_tsv = os.path.join(similarity_dir, "match_ratio_matrix.tsv")
+        match_matrix.to_csv(matrix_tsv, sep="\t")
+
+        results["conservation"] = {
+            "similarity_tsv": similarity_tsv,
+            "matrix_tsv": matrix_tsv,
+            "n_peaks": len(match_matrix),
+            "per_species_median": {
+                sp: float(match_matrix[sp].median())
+                for sp in list(species_beds.keys())
+                if sp in match_matrix.columns
+            },
+        }
+        results["output_files"]["similarity_matrix"] = matrix_tsv
+        results["output_files"]["similarity_detail"] = similarity_tsv
+
+        if verbose:
+            print(f"\n   Conservation scoring complete:")
+            print(f"   Peaks scored: {len(match_matrix):,}")
+            for sp, med in results["conservation"]["per_species_median"].items():
+                print(f"      {sp}: median match_ratio = {med:.3f}")
+            print(f"   Saved: {matrix_tsv}")
+
+    # =========================================================================
     # STEP 5: Identify species-specific peaks
     # =========================================================================
     print("\n" + "=" * 70)
@@ -2817,9 +4415,18 @@ def create_peak_matrix(
 ) -> Dict[str, Any]:
     """
     Create a peak presence/absence matrix across species.
-    Uses the species_detected column from the unified BED if available,
-    otherwise checks lifted-back BED files.
+
+    .. deprecated::
+        Use the master annotation (``build_master_annotation()``) which provides
+        per-species orthology columns.  Kept for backwards compatibility only.
     """
+    import warnings
+    warnings.warn(
+        "create_peak_matrix() is deprecated. Use the master annotation "
+        "(build_master_annotation()) which provides per-species orthology columns.",
+        DeprecationWarning, stacklevel=2,
+    )
+
     peaks = {}
     with open(unified_human_bed) as f:
         for line in f:
