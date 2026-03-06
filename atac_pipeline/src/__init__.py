@@ -65,6 +65,9 @@ from .utils import (
     compare_bed_files,
     load_peaks,
     clean_sample_name,
+    is_treutlein_server,
+    resolve_path,
+    resolve_paths_in_dict,
 )
 
 from .cross_species import (
@@ -95,37 +98,31 @@ from .cross_species import (
     DEFAULT_GTF_FILES,
 )
 
-from .pipeline_steps import (
-    lift_to_human,
-    merge_consensus,
-    lift_back_to_species,
-    filter_liftback,
-    extract_species_specific,
-    generate_master_annotation,
-    rescue_unmapped_peaks,
-    classify_distances,
-    export_final_beds,
-)
+try:
+    from .quantification import (
+        quantify,
+        quantify_matrix,
+        quantify_bigwig,
+        quantify_bigwig_matrix,
+        fragments_to_bigwigs,
+        save_matrix,
+        load_matrix,
+    )
+except ImportError:
+    pass  # quantification requires optional deps (e.g. pybigwig)
 
-from .quantification import (
-    quantify,
-    quantify_matrix,
-    quantify_bigwig,
-    quantify_bigwig_matrix,
-    fragments_to_bigwigs,
-    save_matrix,
-    load_matrix,
-)
-
-from .fragment_matrices import (
-    reindex_nhp,
-    reindex_human,
-    load_species_data,
-    load_regions_as_polars,
-    harmonize_chroms,
-    build_fragment_matrix,
-    create_pseudobulk,
-)
+try:
+    from .fragment_matrices import (
+        reindex_nhp,
+        reindex_human,
+        load_species_data,
+        load_regions_as_polars,
+        harmonize_chroms,
+        build_fragment_matrix,
+        create_pseudobulk,
+    )
+except ImportError:
+    pass  # fragment_matrices requires optional deps (e.g. scipy, polars)
 
 __version__ = "1.0.0"
 __all__ = [
@@ -193,16 +190,6 @@ __all__ = [
     "harmonize_chroms",
     "build_fragment_matrix",
     "create_pseudobulk",
-    # Pipeline steps (high-level wrappers)
-    "lift_to_human",
-    "merge_consensus",
-    "lift_back_to_species",
-    "filter_liftback",
-    "extract_species_specific",
-    "generate_master_annotation",
-    "rescue_unmapped_peaks",
-    "classify_distances",
-    "export_final_beds",
     # BigWig
     "fragments_to_bigwig",
     "create_bigwig",
@@ -223,4 +210,7 @@ __all__ = [
     "compare_bed_files",
     "load_peaks",
     "clean_sample_name",
+    "is_treutlein_server",
+    "resolve_path",
+    "resolve_paths_in_dict",
 ]

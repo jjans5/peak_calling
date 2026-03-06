@@ -7,6 +7,7 @@ Helper functions for configuration, file I/O, and common operations.
 
 import os
 import json
+import socket
 import yaml
 import pandas as pd
 from pathlib import Path
@@ -18,6 +19,74 @@ try:
     HAS_PYRANGES = True
 except ImportError:
     HAS_PYRANGES = False
+
+
+# =============================================================================
+# SERVER DETECTION & PATH RESOLUTION
+# =============================================================================
+
+# Path prefixes that map between Euler (ETH HPC) and the Treutlein lab server.
+# On Euler, data lives under /cluster/{home,project,work,scratch}/...
+# On the Treutlein server, the same data is mounted under /links/groups/...
+#
+# Order matters: more specific prefixes must come first so they match before
+# shorter ones (e.g. /cluster/project/treutlein/USERS/jjans/ before
+# /cluster/project/treutlein/jjans/).
+
+_EULER_TO_TREUTLEIN = [
+    # /cluster/project/treutlein/USERS/jjans/  (peaks, analysis results)
+    ("/cluster/project/treutlein/USERS/jjans/", "/links/groups/treutlein/USERS/jjans/"),
+    # /cluster/work/treutlein/jjans/  (shared data: genomes, chain files)
+    ("/cluster/work/treutlein/jjans/", "/links/groups/treutlein/USERS/jjans/"),
+    # /cluster/home/jjanssens/jjans/  (home dir analysis, cerebellum GTFs)
+    ("/cluster/home/jjanssens/jjans/", "/links/groups/treutlein/USERS/jjans/"),
+    # /cluster/project/treutlein/jjans/  (software installs)
+    ("/cluster/project/treutlein/jjans/", "/links/groups/treutlein/USERS/jjans/"),
+    # /cluster/scratch/jjanssens/  (scratch space)
+    ("/cluster/scratch/jjanssens/", "/links/groups/treutlein/USERS/jjans/scratch/"),
+]
+
+_TREUTLEIN_TO_EULER = [(t, e) for e, t in _EULER_TO_TREUTLEIN]
+
+
+def is_treutlein_server() -> bool:
+    """Return True if running on the Treutlein lab server (bs-*)."""
+    return socket.gethostname().startswith("bs-")
+
+
+def resolve_path(path: str) -> str:
+    """
+    Translate a filesystem path to match the current server.
+
+    * On the Treutlein server (hostname starts with ``bs-``), Euler-style
+      ``/cluster/...`` paths are converted to ``/links/...`` equivalents.
+    * On Euler, ``/links/...`` paths are converted to ``/cluster/...``.
+    * Paths that already match the current server are returned unchanged.
+
+    Parameters
+    ----------
+    path : str
+        An absolute filesystem path.
+
+    Returns
+    -------
+    str
+        The path adjusted for the current machine.
+    """
+    if is_treutlein_server():
+        for euler_pfx, treutlein_pfx in _EULER_TO_TREUTLEIN:
+            if path.startswith(euler_pfx):
+                return path.replace(euler_pfx, treutlein_pfx, 1)
+    else:
+        for treutlein_pfx, euler_pfx in _TREUTLEIN_TO_EULER:
+            if path.startswith(treutlein_pfx):
+                return path.replace(treutlein_pfx, euler_pfx, 1)
+    return path
+
+
+def resolve_paths_in_dict(d: Dict[str, str]) -> Dict[str, str]:
+    """Apply :func:`resolve_path` to every value in a ``{key: path}`` dict."""
+    return {k: resolve_path(v) for k, v in d.items()}
 
 
 # =============================================================================

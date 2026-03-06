@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import pandas as pd
 
+from .utils import resolve_path
+
 # =============================================================================
 # CHAIN FILES
 # =============================================================================
 
-# Default chain file directory (Treutlein lab shared location)
-DEFAULT_CHAIN_DIR = "/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files"
+# Default chain file directory (auto-resolved for Euler vs Treutlein server)
+DEFAULT_CHAIN_DIR = resolve_path("/cluster/work/treutlein/jjans/data/intestine/nhp_atlas/genomes/chain_files")
 
 # Chain file mapping (species -> hg38)
 CHAIN_FILES = {

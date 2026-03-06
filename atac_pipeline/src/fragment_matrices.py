@@ -174,16 +174,28 @@ def load_species_data(
 # ---------------------------------------------------------------------------
 
 def load_regions_as_polars(peak_file: str) -> pl.DataFrame:
-    """Load a BED file and add a ``RegionID`` column (``chr:start-end``)."""
+    """Load a BED file with ``RegionID`` (coordinates) and ``PeakID`` (name).
+
+    ``RegionID`` is always ``chr:start-end`` (used internally for intersection
+    matching).  ``PeakID`` comes from column 4 of the BED file when present
+    (e.g. ``unified_000001``, ``human_peak_000003``); otherwise it falls back
+    to the coordinate string.
+    """
     regions = read_bed_to_polars_df(peak_file, engine="pyarrow", min_column_count=3)
+    # Coordinate-based ID for intersection matching
     regions = regions.with_columns(
         (
             pl.col("Chromosome").cast(pl.Utf8)
             + ":" + pl.col("Start").cast(pl.Utf8)
             + "-" + pl.col("End").cast(pl.Utf8)
         ).alias("RegionID")
-    ).select(["Chromosome", "Start", "End", "RegionID"])
-    return regions
+    )
+    # Use Name column (BED col 4) as immutable PeakID when available
+    if "Name" in regions.columns:
+        regions = regions.with_columns(pl.col("Name").cast(pl.Utf8).alias("PeakID"))
+    else:
+        regions = regions.with_columns(pl.col("RegionID").alias("PeakID"))
+    return regions.select(["Chromosome", "Start", "End", "RegionID", "PeakID"])
 
 
 def harmonize_chroms(
@@ -261,15 +273,22 @@ def build_fragment_matrix(
         Peaks × barcodes sparse count matrix.
     barcodes : list[str]
         Barcode names (columns).
-    region_ids : list[str]
-        Region IDs (rows).
+    peak_ids : list[str]
+        Peak IDs (rows).  Uses the Name column from the BED file when
+        available (e.g. ``unified_000001``); falls back to coordinates.
     meta_df : pd.DataFrame
         Barcode metadata (cell_type, donor, run where available).
     """
     regions_pl = load_regions_as_polars(peak_file)
-    region_ids = regions_pl.get_column("RegionID").to_list()
-    n_regions = len(region_ids)
-    region_to_idx = {rid: i for i, rid in enumerate(region_ids)}
+    region_ids = regions_pl.get_column("RegionID").to_list()  # coords for matching
+    peak_ids = regions_pl.get_column("PeakID").to_list()       # immutable names
+    n_regions = len(peak_ids)
+
+    # Build coord→row_index mapping.
+    # Coordinates may collide after liftover, so we map to ALL rows.
+    region_to_idxs: dict[str, list[int]] = {}
+    for i, rid in enumerate(region_ids):
+        region_to_idxs.setdefault(rid, []).append(i)
 
     all_barcodes: list[str] = []
     all_rows: list[int] = []
@@ -321,7 +340,9 @@ def build_fragment_matrix(
         )
         if regions_changed:
             region_ids = regions_pl.get_column("RegionID").to_list()
-            region_to_idx = {rid: i for i, rid in enumerate(region_ids)}
+            region_to_idxs = {}
+            for i, rid in enumerate(region_ids):
+                region_to_idxs.setdefault(rid, []).append(i)
 
         overlap_df = gr_intersection(
             regions1_df_pl=regions_pl,
@@ -389,10 +410,13 @@ def build_fragment_matrix(
         for i in range(len(region_id_vals)):
             bc = cbs_vals[i]
             rid = region_id_vals[i]
-            if bc in local_bc_map and rid in region_to_idx:
-                all_rows.append(region_to_idx[rid])
-                all_cols.append(local_bc_map[bc])
-                all_vals.append(int(count_vals[i]))
+            if bc in local_bc_map and rid in region_to_idxs:
+                col_idx = local_bc_map[bc]
+                cnt = int(count_vals[i])
+                for row_idx in region_to_idxs[rid]:
+                    all_rows.append(row_idx)
+                    all_cols.append(col_idx)
+                    all_vals.append(cnt)
 
         if verbose:
             print(f" → {len(local_bc_map):,} barcodes with signal")
@@ -402,7 +426,7 @@ def build_fragment_matrix(
     if n_barcodes == 0:
         if verbose:
             print("  ⚠️  No barcodes found!")
-        return None, [], region_ids, pd.DataFrame()
+        return None, [], peak_ids, pd.DataFrame()
 
     if len(set(all_barcodes)) != n_barcodes:
         dupes = [bc for bc, cnt in Counter(all_barcodes).items() if cnt > 1]
@@ -423,8 +447,10 @@ def build_fragment_matrix(
     if verbose:
         print(f"\n  ✅ Final matrix: {n_regions:,} peaks × {n_barcodes:,} barcodes, "
               f"{mat.nnz:,} nonzero entries")
+        if peak_ids and not peak_ids[0].startswith(("chr", "Chr")):
+            print(f"      Peak ID format: '{peak_ids[0]}' … '{peak_ids[-1]}'")
 
-    return mat, all_barcodes, region_ids, meta_df
+    return mat, all_barcodes, peak_ids, meta_df
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +474,8 @@ def create_pseudobulk(
     barcodes : list
         Barcode names (columns of *mat*).
     region_ids : list
-        Region IDs (rows of *mat*).
+        Region / peak IDs (rows of *mat*).  Typically the immutable peak
+        names returned by :func:`build_fragment_matrix`.
     meta_df : pd.DataFrame
         Barcode metadata with columns matching *group_by*.
     group_by : list of str, optional
