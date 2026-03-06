@@ -11,7 +11,6 @@ Pipeline for comparing ATAC-seq peaks across species using UCSC liftOver:
 4. Liftover unified consensus peaks back to each species
    - 4b. (optional) Filter liftback peaks by size
    - 4c. (optional) Reciprocal liftover check (round-trip NHP→hg38 overlap)
-   - 4d. (optional) Per-peak liftover conservation scoring (match_ratio 0–1)
 5. Identify species-specific peaks for each non-human species
 6. Annotate all peaks with closest gene from GTF
 7. Build master annotation — reclassify peaks using orthology
@@ -33,7 +32,7 @@ from collections import defaultdict
 import pandas as pd
 import numpy as np
 
-from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR, compute_liftover_similarity
+from .liftover import liftover_peaks, liftover_two_step, get_chain_file, DEFAULT_CHAIN_DIR
 
 # Reverse chain files (hg38 -> species)
 REVERSE_CHAIN_FILES = {
@@ -65,98 +64,6 @@ def get_reverse_chain_file(species: str, chain_dir: str = DEFAULT_CHAIN_DIR) -> 
     if species not in REVERSE_CHAIN_FILES:
         raise ValueError(f"Unknown species: {species}. Available: {list(REVERSE_CHAIN_FILES.keys())}")
     return os.path.join(chain_dir, REVERSE_CHAIN_FILES[species])
-
-
-def compute_species_similarity(
-    input_bed: str,
-    species_list: Optional[List[str]] = None,
-    chain_dir: str = DEFAULT_CHAIN_DIR,
-    liftover_path: str = "liftOver",
-    output_tsv: Optional[str] = None,
-    verbose: bool = True,
-    ncpu: int = 1,
-) -> pd.DataFrame:
-    """
-    Compute per-peak liftover similarity for multiple species.
-
-    For each species, performs a round-trip liftover
-    (hg38 → species → hg38) and measures how many bases survive.
-    Returns a combined DataFrame with a ``species`` column.
-
-    Parameters
-    ----------
-    input_bed : str
-        BED file in hg38 coordinates (e.g. unified consensus).
-    species_list : list of str, optional
-        Species to compute similarity for.
-        Default: ``["Bonobo", "Chimpanzee", "Gorilla", "Macaque", "Marmoset"]``
-    chain_dir : str
-        Directory containing chain files.
-    liftover_path : str
-        Path to UCSC ``liftOver`` executable.
-    output_tsv : str, optional
-        If provided, save combined results to this TSV file.
-    verbose : bool
-        Print progress.
-    ncpu : int
-        Workers for parallel liftover.
-
-    Returns
-    -------
-    pd.DataFrame
-        Combined DataFrame with columns from ``compute_liftover_similarity``
-        plus a ``species`` column.
-    """
-    if species_list is None:
-        species_list = ["Bonobo", "Chimpanzee", "Gorilla", "Macaque", "Marmoset"]
-
-    all_dfs = []
-    for species in species_list:
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"  {species}")
-            print(f"{'='*60}")
-
-        # Resolve chain files
-        if species == "Marmoset":
-            chain_fwd = get_chain_file("Marmoset_step1", chain_dir)
-            chain_fwd_2 = get_chain_file("Marmoset_step2", chain_dir)
-            chain_rev = get_reverse_chain_file("Marmoset_step1", chain_dir)
-            chain_rev_2 = get_reverse_chain_file("Marmoset_step2", chain_dir)
-            # Forward: hg38 → calJac4 → calJac1  (reverse of species→hg38)
-            # So forward = reverse chains, reverse = forward chains
-            df = compute_liftover_similarity(
-                input_bed=input_bed,
-                chain_forward=chain_rev,      # hg38 → calJac4
-                chain_reverse=chain_fwd,      # calJac4 → hg38
-                chain_forward_2=chain_rev_2,  # calJac4 → calJac1
-                chain_reverse_2=chain_fwd_2,  # calJac1 → calJac4
-                liftover_path=liftover_path,
-                auto_chr=True, verbose=verbose, ncpu=ncpu,
-            )
-        else:
-            chain_rev = get_reverse_chain_file(species, chain_dir)
-            chain_fwd = get_chain_file(species, chain_dir)
-            df = compute_liftover_similarity(
-                input_bed=input_bed,
-                chain_forward=chain_rev,   # hg38 → species
-                chain_reverse=chain_fwd,   # species → hg38
-                liftover_path=liftover_path,
-                auto_chr=True, verbose=verbose, ncpu=ncpu,
-            )
-
-        df['species'] = species
-        all_dfs.append(df)
-
-    combined = pd.concat(all_dfs, ignore_index=True)
-
-    if output_tsv:
-        os.makedirs(os.path.dirname(output_tsv) or '.', exist_ok=True)
-        combined.to_csv(output_tsv, sep='\t', index=False)
-        if verbose:
-            print(f"\n💾 Saved combined similarity to: {output_tsv}")
-
-    return combined
 
 
 # =============================================================================
@@ -1182,6 +1089,63 @@ def annotate_with_closest_gene(
             at_tss = (df["distance_to_gene"] == 0).sum()
             print(f"   Median distance to TSS: {median_dist:,.0f} bp")
             print(f"   Peaks at TSS (distance=0): {at_tss:,}")
+
+    return df
+
+
+def classify_peak_distance(
+    master_df: pd.DataFrame,
+    species_list: Optional[List[str]] = None,
+    promoter_threshold: int = 200,
+    proximal_threshold: int = 2000,
+) -> pd.DataFrame:
+    """
+    Classify peaks by distance to nearest gene TSS.
+
+    Adds ``{Species}_region`` columns with values:
+    - ``promoter``  : distance < promoter_threshold (default 200 bp)
+    - ``proximal``  : promoter_threshold <= distance < proximal_threshold (default 2000 bp)
+    - ``distal``    : distance >= proximal_threshold
+
+    Also adds a ``Human_region`` column (or whichever species has gene_dist data).
+
+    Parameters
+    ----------
+    master_df : pd.DataFrame
+        Master annotation DataFrame (with ``{Species}_gene_dist`` columns).
+    species_list : list of str, optional
+        Species to classify. Defaults to all species that have
+        a ``{species}_gene_dist`` column.
+    promoter_threshold : int
+        Max distance (bp) for promoter classification (default 200).
+    proximal_threshold : int
+        Max distance (bp) for proximal classification (default 2000).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of master_df with added ``{Species}_region`` columns.
+    """
+    df = master_df.copy()
+
+    if species_list is None:
+        species_list = [
+            col.replace("_gene_dist", "")
+            for col in df.columns
+            if col.endswith("_gene_dist")
+        ]
+
+    for sp in species_list:
+        dist_col = f"{sp}_gene_dist"
+        region_col = f"{sp}_region"
+        if dist_col not in df.columns:
+            continue
+        dist = pd.to_numeric(df[dist_col], errors="coerce")
+        df[region_col] = pd.cut(
+            dist.abs(),
+            bins=[-1, promoter_threshold, proximal_threshold, float("inf")],
+            labels=["promoter", "proximal", "distal"],
+        )
 
     return df
 
@@ -3843,7 +3807,6 @@ def cross_species_consensus_pipeline(
     min_liftback_size: Optional[int] = None,
     reciprocal_check: bool = False,
     max_reciprocal_distance: int = 500,
-    compute_conservation: bool = False,
     gtf_files: Optional[Dict[str, str]] = None,
     pre_lifted_beds: Optional[Dict[str, str]] = None,
     verbose: bool = True,
@@ -3859,7 +3822,6 @@ def cross_species_consensus_pipeline(
     4. Liftover temp consensus peaks back to each species
        - 4b. (optional) Size-filter liftback peaks
        - 4c. (optional) Reciprocal liftover check
-       - 4d. (optional) Per-peak liftover conservation scoring
     5. Identify species-specific peaks for each non-human species
     6. Annotate all peaks with closest gene
     7. Build master annotation — reclassify peaks using orthology:
@@ -3906,10 +3868,6 @@ def cross_species_consensus_pipeline(
         max_reciprocal_distance: Max distance (bp) between original and
             round-trip hg38 positions for a peak to pass the reciprocal
             check (default 500).
-        compute_conservation: If True, run per-peak liftover conservation
-            scoring (Step 4d) — round-trip liftover hg38 → species → hg38
-            measuring match_ratio (fraction of bases recovered). Results
-            are saved to ``10_similarity/`` and attached to ``results``.
         gtf_files: Dict mapping species name to GTF file path (optional)
         pre_lifted_beds: Optional dict mapping species name to path of
             pre-computed liftover BED files (already in hg38 coords).
@@ -4189,71 +4147,6 @@ def cross_species_consensus_pipeline(
                                    f"unified_consensus_{species}.bed")
                 shutil.copy2(pass_file, dst)
                 results["output_files"][f"liftback_{species}"] = dst
-
-    # =========================================================================
-    # STEP 4d: (optional) Per-peak liftover conservation scoring
-    # =========================================================================
-    if compute_conservation:
-        print("\n" + "=" * 70)
-        print("STEP 4d: Per-peak liftover conservation scoring (round-trip match ratio)")
-        print("-" * 50)
-
-        similarity_dir = os.path.join(output_dir, "10_similarity")
-        os.makedirs(similarity_dir, exist_ok=True)
-        similarity_tsv = os.path.join(similarity_dir,
-                                      "liftover_similarity_all_species.tsv")
-
-        similarity_df = compute_species_similarity(
-            input_bed=unified_bed4,
-            species_list=list(species_beds.keys()),
-            chain_dir=chain_dir,
-            liftover_path=liftover_path,
-            output_tsv=similarity_tsv,
-            verbose=verbose,
-            ncpu=ncpu,
-        )
-
-        # Pivot to a peak × species match-ratio matrix
-        match_matrix = similarity_df.pivot(
-            index="peak_id", columns="species", values="match_ratio"
-        )
-        match_matrix["Human"] = 1.0
-        col_order = ["Human"] + [s for s in ["Chimpanzee", "Bonobo",
-                     "Gorilla", "Macaque", "Marmoset"]
-                     if s in match_matrix.columns]
-        match_matrix = match_matrix[
-            [c for c in col_order if c in match_matrix.columns]
-        ]
-
-        # Attach coordinates
-        first_sp = similarity_df["species"].iloc[0]
-        coords = similarity_df[similarity_df["species"] == first_sp][
-            ["peak_id", "chrom", "start", "end", "original_size"]
-        ].set_index("peak_id")
-        match_matrix = coords.join(match_matrix)
-
-        matrix_tsv = os.path.join(similarity_dir, "match_ratio_matrix.tsv")
-        match_matrix.to_csv(matrix_tsv, sep="\t")
-
-        results["conservation"] = {
-            "similarity_tsv": similarity_tsv,
-            "matrix_tsv": matrix_tsv,
-            "n_peaks": len(match_matrix),
-            "per_species_median": {
-                sp: float(match_matrix[sp].median())
-                for sp in list(species_beds.keys())
-                if sp in match_matrix.columns
-            },
-        }
-        results["output_files"]["similarity_matrix"] = matrix_tsv
-        results["output_files"]["similarity_detail"] = similarity_tsv
-
-        if verbose:
-            print(f"\n   Conservation scoring complete:")
-            print(f"   Peaks scored: {len(match_matrix):,}")
-            for sp, med in results["conservation"]["per_species_median"].items():
-                print(f"      {sp}: median match_ratio = {med:.3f}")
-            print(f"   Saved: {matrix_tsv}")
 
     # =========================================================================
     # STEP 5: Identify species-specific peaks

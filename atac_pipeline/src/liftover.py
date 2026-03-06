@@ -709,19 +709,23 @@ def compute_liftover_similarity(
             for p in input_peaks:
                 f.write(f"{p['chrom']}\t{p['start']}\t{p['end']}\t{p['peak_id']}\n")
 
+        # NOTE: UCSC liftOver crashes (exit 255) with minMatch=0.0.
+        # Use 0.001 as the lowest safe threshold to accept all mappable bases.
+        _SIM_MIN_MATCH = 0.001
+
         two_step_forward = chain_forward_2 is not None
         if two_step_forward:
             fwd_result = liftover_two_step(
                 input_bed=fwd_input, output_bed=fwd_output,
                 chain_file_1=chain_forward, chain_file_2=chain_forward_2,
-                liftover_path=liftover_path, min_match=0.0,
+                liftover_path=liftover_path, min_match=_SIM_MIN_MATCH,
                 auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
             )
         else:
             fwd_result = liftover_peaks(
                 input_bed=fwd_input, output_bed=fwd_output,
                 chain_file=chain_forward, liftover_path=liftover_path,
-                min_match=0.0, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+                min_match=_SIM_MIN_MATCH, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
             )
 
         if verbose:
@@ -753,14 +757,14 @@ def compute_liftover_similarity(
             rev_result = liftover_two_step(
                 input_bed=rev_input, output_bed=rev_output,
                 chain_file_1=chain_reverse, chain_file_2=chain_reverse_2,
-                liftover_path=liftover_path, min_match=0.0,
+                liftover_path=liftover_path, min_match=_SIM_MIN_MATCH,
                 auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
             )
         else:
             rev_result = liftover_peaks(
                 input_bed=rev_input, output_bed=rev_output,
                 chain_file=chain_reverse, liftover_path=liftover_path,
-                min_match=0.0, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
+                min_match=_SIM_MIN_MATCH, auto_chr=auto_chr, verbose=verbose, ncpu=ncpu,
             )
 
         if verbose:

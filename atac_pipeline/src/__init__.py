@@ -34,7 +34,6 @@ from .liftover import (
     liftover_peaks,
     liftover_two_step,
     liftover_fragments_parallel,
-    compute_liftover_similarity,
     print_chain_info,
     get_chain_file,
     CHAIN_FILES,
@@ -70,7 +69,6 @@ from .utils import (
 
 from .cross_species import (
     cross_species_consensus_pipeline,
-    compute_species_similarity,
     merge_with_species_tracking,
     merge_bed_files,
     add_peak_ids,
@@ -80,6 +78,7 @@ from .cross_species import (
     create_peak_annotation,
     extract_gene_bed_from_gtf,
     annotate_with_closest_gene,
+    classify_peak_distance,
     find_species_specific_peaks,
     cross_map_species_specific_peaks,
     get_reverse_chain_file,
@@ -96,6 +95,18 @@ from .cross_species import (
     DEFAULT_GTF_FILES,
 )
 
+from .pipeline_steps import (
+    lift_to_human,
+    merge_consensus,
+    lift_back_to_species,
+    filter_liftback,
+    extract_species_specific,
+    generate_master_annotation,
+    rescue_unmapped_peaks,
+    classify_distances,
+    export_final_beds,
+)
+
 from .quantification import (
     quantify,
     quantify_matrix,
@@ -104,6 +115,16 @@ from .quantification import (
     fragments_to_bigwigs,
     save_matrix,
     load_matrix,
+)
+
+from .fragment_matrices import (
+    reindex_nhp,
+    reindex_human,
+    load_species_data,
+    load_regions_as_polars,
+    harmonize_chroms,
+    build_fragment_matrix,
+    create_pseudobulk,
 )
 
 __version__ = "1.0.0"
@@ -126,14 +147,12 @@ __all__ = [
     "liftover_peaks",
     "liftover_two_step",
     "liftover_fragments_parallel",
-    "compute_liftover_similarity",
     "print_chain_info",
     "get_chain_file",
     "CHAIN_FILES",
     "DEFAULT_CHAIN_DIR",
     # Cross-species
     "cross_species_consensus_pipeline",
-    "compute_species_similarity",
     "merge_with_species_tracking",
     "merge_bed_files",  # deprecated
     "add_peak_ids",
@@ -143,6 +162,7 @@ __all__ = [
     "create_peak_annotation",
     "extract_gene_bed_from_gtf",
     "annotate_with_closest_gene",
+    "classify_peak_distance",
     "find_species_specific_peaks",
     "cross_map_species_specific_peaks",
     "get_reverse_chain_file",
@@ -165,6 +185,24 @@ __all__ = [
     "fragments_to_bigwigs",
     "save_matrix",
     "load_matrix",
+    # Fragment matrices & pseudobulk
+    "reindex_nhp",
+    "reindex_human",
+    "load_species_data",
+    "load_regions_as_polars",
+    "harmonize_chroms",
+    "build_fragment_matrix",
+    "create_pseudobulk",
+    # Pipeline steps (high-level wrappers)
+    "lift_to_human",
+    "merge_consensus",
+    "lift_back_to_species",
+    "filter_liftback",
+    "extract_species_specific",
+    "generate_master_annotation",
+    "rescue_unmapped_peaks",
+    "classify_distances",
+    "export_final_beds",
     # BigWig
     "fragments_to_bigwig",
     "create_bigwig",
