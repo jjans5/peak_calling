@@ -277,7 +277,7 @@ def build_fragment_matrix(
         Peak IDs (rows).  Uses the Name column from the BED file when
         available (e.g. ``unified_000001``); falls back to coordinates.
     meta_df : pd.DataFrame
-        Barcode metadata (cell_type, donor, run where available).
+        Barcode metadata (cell_type, donor, region, age, run where available).
     """
     regions_pl = load_regions_as_polars(peak_file)
     region_ids = regions_pl.get_column("RegionID").to_list()  # coords for matching
@@ -299,6 +299,8 @@ def build_fragment_matrix(
     has_individual = "Individual" in cell_data.columns
     has_run = "Sequencing.Run" in cell_data.columns
     has_celltype = "cell_type_initial" in cell_data.columns
+    has_region = "Region" in cell_data.columns
+    has_age = "Age" in cell_data.columns
     _first_sample = True
 
     for sample_idx, (sample, frag_path) in enumerate(sorted(fragments_dict.items())):
@@ -401,6 +403,10 @@ def build_fragment_matrix(
                         rec["donor"] = cell_data.at[full_bc, "Individual"]
                     if has_run:
                         rec["run"] = cell_data.at[full_bc, "Sequencing.Run"]
+                    if has_region:
+                        rec["region"] = cell_data.at[full_bc, "Region"]
+                    if has_age:
+                        rec["age"] = cell_data.at[full_bc, "Age"]
                 meta_records.append(rec)
 
         region_id_vals = region_cb_counts.get_column(region_col).to_list()
