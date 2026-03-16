@@ -1,0 +1,78 @@
+paths:
+  base_dir: /home/jjanssens/jjans/analysis/adult_intestine
+  scenicplus_dir: "{base_dir}/scenicplus"
+  metadata_dir: "{base_dir}/rna/integration/meta_data"
+  input_files_dir: "{scenicplus_dir}/input_files"
+  temp_dir: "{scenicplus_dir}/tmp"
+  logs_dir: "{scenicplus_dir}/logs"
+  manifests_dir: "{scenicplus_dir}/manifests"
+  scripts_dir: "{scenicplus_dir}/scripts"
+
+run:
+  species_list: [Human, Gorilla, Chimpanzee, Bonobo, Macaque, Marmoset]
+  seeds: [42, 123, 666]
+  cell_type_subset: null
+  downsample_mode: min
+  downsample_n: null
+  n_cpu: 40
+  cell_type_col: cell_type_initial
+  auto_execute_batch: false
+  snakemake_extra_args: "--use-conda"
+
+shared_tasks:
+  link_consensus:
+    enabled: true
+    min_seed_support: 2
+  motif_dar_topic:
+    enabled: false
+    command_template: ""
+
+species_config:
+  Human:
+    biomart_species: hsapiens
+    ctx_db: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/screen/mc_v10_clust/region_based/hg38_screen_v10_clust.regions_vs_motifs.rankings.feather
+    dem_db: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/screen/mc_v10_clust/region_based/hg38_screen_v10_clust.regions_vs_motifs.scores.feather
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Human"
+    genome_annotation: "{input_files_dir}/Human_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Human_chromsizes.tsv"
+  Gorilla:
+    biomart_species: ggorilla
+    ctx_db: "{base_dir}/atac/cistarget_databases/database/Gorilla_1kb_bg_with_mask.regions_vs_motifs.rankings.feather"
+    dem_db: "{base_dir}/atac/cistarget_databases/database/Gorilla_1kb_bg_with_mask.regions_vs_motifs.scores.feather"
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Gorilla"
+    genome_annotation: "{input_files_dir}/Gorilla_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Gorilla_chromsizes.tsv"
+  Chimpanzee:
+    biomart_species: ptroglodytes
+    ctx_db: "{base_dir}/atac/cistarget_databases/database/Chimpanzee_1kb_bg_with_mask.regions_vs_motifs.rankings.feather"
+    dem_db: "{base_dir}/atac/cistarget_databases/database/Chimpanzee_1kb_bg_with_mask.regions_vs_motifs.scores.feather"
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Chimpanzee"
+    genome_annotation: "{input_files_dir}/Chimpanzee_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Chimpanzee_chromsizes.tsv"
+  Bonobo:
+    biomart_species: ppaniscus
+    ctx_db: "{base_dir}/atac/cistarget_databases/database/Bonobo_1kb_bg_with_mask.regions_vs_motifs.rankings.feather"
+    dem_db: "{base_dir}/atac/cistarget_databases/database/Bonobo_1kb_bg_with_mask.regions_vs_motifs.scores.feather"
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Bonobo"
+    genome_annotation: "{input_files_dir}/Bonobo_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Bonobo_chromsizes.tsv"
+  Macaque:
+    biomart_species: mmulatta
+    ctx_db: "{base_dir}/atac/cistarget_databases/database/Macaque_1kb_bg_with_mask.regions_vs_motifs.rankings.feather"
+    dem_db: "{base_dir}/atac/cistarget_databases/database/Macaque_1kb_bg_with_mask.regions_vs_motifs.scores.feather"
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Macaque"
+    genome_annotation: "{input_files_dir}/Macaque_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Macaque_chromsizes.tsv"
+  Marmoset:
+    biomart_species: cjacchus
+    ctx_db: "{base_dir}/atac/cistarget_databases/database/Marmoset_1kb_bg_with_mask.regions_vs_motifs.rankings.feather"
+    dem_db: "{base_dir}/atac/cistarget_databases/database/Marmoset_1kb_bg_with_mask.regions_vs_motifs.scores.feather"
+    motif_annotations: /home/jjanssens/jjans/resources/resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+    region_set_folder: "{base_dir}/atac/region_sets_Marmoset"
+    genome_annotation: "{input_files_dir}/Marmoset_genome_annotation.txt"
+    chromsizes: "{input_files_dir}/Marmoset_chromsizes.tsv"
