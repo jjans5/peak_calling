@@ -42,3 +42,13 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# AI/LLM assistant artifacts
+.claude/
+.copilot/
+.cursor/
+.continue/
+.codeium/
+.windsurf/
+.roo/
+.github/copilot-instructions.md
