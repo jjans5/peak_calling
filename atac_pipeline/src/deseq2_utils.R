@@ -353,13 +353,21 @@ make_contrast_vector <- function(sp_pos, sp_neg, res_names) {
 #' @param out_dir       Directory to save per-cell-type CSV results
 #' @return Named list: res_list[[cell_type]][[species]] = DESeq2 results
 run_deseq2_shared_peaks <- function(counts_shared, meta_shared, species,
-                                    out_dir) {
-  suppressPackageStartupMessages(library(DESeq2))
+                                    out_dir,
+                                    filter_outliers = TRUE, sd_thresh = 2.5) {
+  suppressPackageStartupMessages({
+    library(DESeq2)
+    library(dplyr)
+  })
 
-  res_dir <- file.path(out_dir, "differential_results", "shared_peaks")
-  dir.create(res_dir, showWarnings = FALSE, recursive = TRUE)
+  summary_dir <- file.path(out_dir, "_summary")
+  dir.create(summary_dir, showWarnings = FALSE, recursive = TRUE)
 
-  res_list   <- list()
+  res_list       <- list()
+  outlier_log_df <- data.frame(cell_type = character(), contrast = character(),
+                               sample_id = character(), species = character(),
+                               log2_lib_size = numeric(),
+                               stringsAsFactors = FALSE)
   cell_types <- levels(meta_shared$cell_type)
 
   for (ct in cell_types) {
@@ -375,8 +383,31 @@ run_deseq2_shared_peaks <- function(counts_shared, meta_shared, species,
     }
 
     # Local peak filter for this cell type
-    keep_ct           <- rowSums(counts_ct >= 10) >= 3
+    keep_ct            <- rowSums(counts_ct >= 10) >= 3
     counts_ct_filtered <- counts_ct[keep_ct, ]
+
+    # Per-cell-type outlier filtering (applied once, before fitting the model)
+    if (filter_outliers) {
+      outlier_flags <- detect_per_contrast_outliers(counts_ct_filtered, meta_ct,
+                                                    sd_thresh = sd_thresh)
+      removed_ids <- names(outlier_flags)[outlier_flags]
+      if (length(removed_ids) > 0) {
+        lib_vec        <- log2(colSums(counts_ct_filtered) + 1)
+        outlier_log_df <- append_outlier_log(outlier_log_df, ct, "shared_peaks_all_species",
+                                             removed_ids, meta_ct, lib_vec)
+        keep_samp          <- colnames(counts_ct_filtered)[!outlier_flags]
+        meta_ct            <- meta_ct[keep_samp, ]
+        counts_ct_filtered <- counts_ct_filtered[, keep_samp, drop = FALSE]
+        meta_ct$species    <- droplevels(meta_ct$species)
+        message(sprintf("  Outliers removed: %s", paste(removed_ids, collapse = ", ")))
+      }
+    }
+
+    if (ncol(counts_ct_filtered) < 4 ||
+        length(unique(as.character(meta_ct$species))) < 2) {
+      message("  Skipping: too few samples after outlier removal.")
+      next
+    }
 
     dds_ct <- DESeqDataSetFromMatrix(
       countData = round(counts_ct_filtered),
@@ -387,8 +418,8 @@ run_deseq2_shared_peaks <- function(counts_shared, meta_shared, species,
     dds_ct <- DESeq(dds_ct, quiet = TRUE)
 
     res_list[[ct]] <- list()
-    ct_dir <- file.path(res_dir, ct)
-    dir.create(ct_dir, showWarnings = FALSE)
+    ct_dir <- file.path(out_dir, ct, "atac_shared")
+    dir.create(ct_dir, showWarnings = FALSE, recursive = TRUE)
 
     res_names <- resultsNames(dds_ct)
 
@@ -407,7 +438,7 @@ run_deseq2_shared_peaks <- function(counts_shared, meta_shared, species,
       res_df            <- as.data.frame(res_sp_ordered)
       res_df$peak_id    <- rownames(res_df)
       res_df            <- res_df[, c("peak_id", setdiff(names(res_df), "peak_id"))]
-      out_file          <- file.path(ct_dir, paste0(target_sp, "_vs_All_Others.csv"))
+      out_file          <- file.path(ct_dir, paste0(target_sp, "_vs_rest_DA.csv"))
       write.csv(res_df, out_file, row.names = FALSE)
 
       sig_hits <- sum(res_sp$padj < 0.05 & res_sp$log2FoldChange > 1, na.rm = TRUE)
@@ -415,7 +446,13 @@ run_deseq2_shared_peaks <- function(counts_shared, meta_shared, species,
     }
   }
 
-  saveRDS(res_list, file.path(res_dir, "DESeq2_res_list_shared.rds"))
+  saveRDS(res_list, file.path(out_dir, "_summary", "DESeq2_res_list_shared.rds"))
+  if (nrow(outlier_log_df) > 0) {
+    write.csv(outlier_log_df,
+              file.path(out_dir, "_summary", "outlier_shared_DA.csv"),
+              row.names = FALSE)
+    message("Shared-peaks outlier log saved (", nrow(outlier_log_df), " removals).")
+  }
   message("\nCheckpoint: shared-peaks res_list saved.")
   return(res_list)
 }
@@ -437,8 +474,7 @@ run_deseq2_contrast_peaks <- function(counts_union, meta_shared, species,
                                       out_dir, min_samples = 3) {
   suppressPackageStartupMessages(library(DESeq2))
 
-  res_dir <- file.path(out_dir, "differential_results", "contrast_peaks")
-  dir.create(res_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(out_dir, "_summary"), showWarnings = FALSE, recursive = TRUE)
 
   res_list   <- list()
   cell_types <- levels(meta_shared$cell_type)
@@ -476,8 +512,8 @@ run_deseq2_contrast_peaks <- function(counts_union, meta_shared, species,
     dds_ct <- DESeq(dds_ct, quiet = TRUE)
 
     res_list[[ct]] <- list()
-    ct_dir <- file.path(res_dir, ct)
-    dir.create(ct_dir, showWarnings = FALSE)
+    ct_dir <- file.path(out_dir, ct, "atac_contrast")
+    dir.create(ct_dir, showWarnings = FALSE, recursive = TRUE)
 
     res_names <- resultsNames(dds_ct)
 
@@ -496,7 +532,7 @@ run_deseq2_contrast_peaks <- function(counts_union, meta_shared, species,
       res_df         <- as.data.frame(res_sp_ordered)
       res_df$peak_id <- rownames(res_df)
       res_df         <- res_df[, c("peak_id", setdiff(names(res_df), "peak_id"))]
-      out_file       <- file.path(ct_dir, paste0(target_sp, "_vs_All_Others.csv"))
+      out_file       <- file.path(ct_dir, paste0(target_sp, "_vs_rest_DA.csv"))
       write.csv(res_df, out_file, row.names = FALSE)
 
       sig_hits <- sum(res_sp$padj < 0.05 & res_sp$log2FoldChange > 1, na.rm = TRUE)
@@ -504,7 +540,7 @@ run_deseq2_contrast_peaks <- function(counts_union, meta_shared, species,
     }
   }
 
-  saveRDS(res_list, file.path(res_dir, "DESeq2_res_list_contrast.rds"))
+  saveRDS(res_list, file.path(out_dir, "_summary", "DESeq2_res_list_contrast.rds"))
   message("\nCheckpoint: contrast-peaks res_list saved.")
   return(res_list)
 }
@@ -580,10 +616,124 @@ define_evolutionary_contrasts <- function() {
     "Pair_Human_vs_Chimp"    = list(pos = c("Human"), neg = c("Chimpanzee")),
     "Pair_Human_vs_Bonobo"   = list(pos = c("Human"), neg = c("Bonobo")),
     "Pair_Human_vs_Macaque"  = list(pos = c("Human"), neg = c("Macaque")),
-    "Pair_Human_vs_Marmoset" = list(pos = c("Human"), neg = c("Marmoset"))
+    "Pair_Human_vs_Marmoset" = list(pos = c("Human"), neg = c("Marmoset")),
+
+    # --- Broader Clade Contrasts ---
+    # Human vs all non-human primates (broadest human-specific test)
+    "Div_Human_vs_AllPrimates" = list(pos = c("Human"),
+                                      neg = c("Chimpanzee", "Bonobo", "Gorilla",
+                                              "Macaque", "Marmoset")),
+    # Apes (Hominoidea) vs monkeys (Cercopithecidae + Cebidae) — major taxonomic split
+    "Node_Apes_vs_Monkeys"     = list(pos = c("Human", "Chimpanzee", "Bonobo", "Gorilla"),
+                                      neg = c("Macaque", "Marmoset"))
   )
   message("Defined ", length(contrasts), " evolutionary contrasts.")
   return(contrasts)
+}
+
+
+# =============================================================================
+# SECTION 3c: PER-CONTRAST OUTLIER DETECTION
+# =============================================================================
+
+#' Detect outlier samples within a single contrast's count matrix
+#'
+#' For each species group in the contrast, flags samples whose log2 library size
+#' falls more than sd_thresh SDs below the species mean. Never reduces any
+#' species below min_per_species surviving samples.
+#'
+#' @param counts      Count matrix for this contrast (peaks x samples)
+#' @param meta        Metadata for those samples (must have 'species' column)
+#' @param sd_thresh   SD threshold below species mean to flag (default 2.5)
+#' @param min_per_species Minimum samples to retain per species (default 2)
+#' @return Named logical vector: TRUE = outlier. Names = sample IDs.
+detect_per_contrast_outliers <- function(counts, meta,
+                                         sd_thresh = 2.5,
+                                         min_per_species = 2) {
+  lib_sizes     <- log2(colSums(counts) + 1)
+  outlier_flags <- setNames(rep(FALSE, ncol(counts)), colnames(counts))
+
+  for (sp in unique(as.character(meta$species))) {
+    sp_cols <- intersect(rownames(meta)[meta$species == sp], colnames(counts))
+    if (length(sp_cols) < 3) next          # can't estimate spread with < 3
+
+    sp_lib  <- lib_sizes[sp_cols]
+    sp_sd   <- sd(sp_lib)
+    if (sp_sd == 0) next
+
+    low_signal <- sp_lib < (mean(sp_lib) - sd_thresh * sp_sd)
+
+    # Safety: never drop below min_per_species
+    if (sum(!low_signal) >= min_per_species) {
+      outlier_flags[sp_cols[low_signal]] <- TRUE
+    }
+  }
+  return(outlier_flags)
+}
+
+
+#' Append to an outlier log data frame
+#'
+#' @param log_df      Existing log data.frame (may be empty)
+#' @param cell_type   Cell type label
+#' @param contrast    Contrast name
+#' @param sample_ids  Character vector of removed sample IDs
+#' @param meta        Metadata for species lookup
+#' @param lib_sizes   Named numeric vector of log2 library sizes
+#' @return Updated log data.frame
+append_outlier_log <- function(log_df, cell_type, contrast,
+                               sample_ids, meta, lib_sizes) {
+  if (length(sample_ids) == 0) return(log_df)
+  new_rows <- data.frame(
+    cell_type    = cell_type,
+    contrast     = contrast,
+    sample_id    = sample_ids,
+    species      = as.character(meta[sample_ids, "species"]),
+    log2_lib_size = round(lib_sizes[sample_ids], 3),
+    stringsAsFactors = FALSE
+  )
+  rbind(log_df, new_rows)
+}
+
+
+#' Save outlier removal summary to CSV and print a compact report
+#'
+#' @param outlier_log_df Data frame from append_outlier_log() calls
+#' @param out_dir        Output directory
+save_outlier_summary <- function(outlier_log_df, out_dir) {
+  out_file <- file.path(out_dir, "_summary", "outlier_samples_removed.csv")
+  dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
+
+  if (nrow(outlier_log_df) == 0) {
+    message("\nOutlier filtering: no samples removed across all contrasts.")
+    write.csv(data.frame(cell_type = character(), contrast = character(),
+                         sample_id = character(), species = character(),
+                         log2_lib_size = numeric()),
+              out_file, row.names = FALSE)
+    return(invisible(NULL))
+  }
+
+  write.csv(outlier_log_df, out_file, row.names = FALSE)
+
+  # Print compact summary grouped by sample
+  sample_summary <- outlier_log_df %>%
+    group_by(sample_id, species, log2_lib_size) %>%
+    summarize(n_contrasts_removed = n(),
+              cell_types = paste(unique(cell_type), collapse = "; "),
+              .groups = "drop") %>%
+    arrange(species, log2_lib_size)
+
+  message("\n=== Outlier samples removed (", nrow(outlier_log_df),
+          " sample×contrast removals across ",
+          length(unique(outlier_log_df$sample_id)), " unique samples) ===")
+  for (i in seq_len(nrow(sample_summary))) {
+    r <- sample_summary[i, ]
+    message(sprintf("  %-45s [%s]  log2-lib=%.2f  removed from %d contrast(s)",
+                    r$sample_id, r$species, r$log2_lib_size,
+                    r$n_contrasts_removed))
+  }
+  message("Full log saved: ", basename(out_file))
+  invisible(sample_summary)
 }
 
 
@@ -600,13 +750,20 @@ define_evolutionary_contrasts <- function() {
 #' @param min_samples    Min samples with signal for a peak (default 2)
 #' @return Named list: branch_res[[cell_type]][[contrast_name]] = DESeq2 results
 run_deseq2_evolutionary <- function(counts_union, meta_shared, contrasts,
-                                    ortho_mat, out_dir, min_samples = 2) {
-  suppressPackageStartupMessages(library(DESeq2))
+                                    ortho_mat, out_dir, min_samples = 2,
+                                    filter_outliers = TRUE, sd_thresh = 2.5) {
+  suppressPackageStartupMessages({
+    library(DESeq2)
+    library(dplyr)
+  })
 
-  branch_dir <- file.path(out_dir, "differential_results", "evolutionary_branches")
-  dir.create(branch_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(out_dir, "_summary"), showWarnings = FALSE, recursive = TRUE)
 
-  branch_res <- list()
+  branch_res    <- list()
+  outlier_log_df <- data.frame(cell_type = character(), contrast = character(),
+                               sample_id = character(), species = character(),
+                               log2_lib_size = numeric(),
+                               stringsAsFactors = FALSE)
   cell_types <- levels(meta_shared$cell_type)
 
   valid_samples <- intersect(rownames(meta_shared), colnames(counts_union))
@@ -645,6 +802,24 @@ run_deseq2_evolutionary <- function(counts_union, meta_shared, contrasts,
 
       node_counts <- counts_union[valid_peaks, node_samples, drop = FALSE]
 
+      # Per-contrast outlier filtering
+      if (filter_outliers) {
+        outlier_flags <- detect_per_contrast_outliers(node_counts, node_meta,
+                                                      sd_thresh = sd_thresh)
+        removed_ids <- names(outlier_flags)[outlier_flags]
+        if (length(removed_ids) > 0) {
+          lib_vec <- log2(colSums(node_counts) + 1)
+          outlier_log_df <- append_outlier_log(outlier_log_df, ct, node_name,
+                                               removed_ids, node_meta, lib_vec)
+          keep_samp   <- node_samples[!outlier_flags[node_samples]]
+          node_meta   <- node_meta[keep_samp, ]
+          node_counts <- node_counts[, keep_samp, drop = FALSE]
+          node_meta$species <- droplevels(node_meta$species)
+          message(sprintf("    Outliers removed: %s", paste(removed_ids, collapse = ", ")))
+        }
+        if (length(node_samples[!outlier_flags[node_samples]]) < 4) next
+      }
+
       # Active peak filter
       keep <- rowSums(node_counts >= 10) >= min_samples
       node_counts <- node_counts[keep, , drop = FALSE]
@@ -669,24 +844,25 @@ run_deseq2_evolutionary <- function(counts_union, meta_shared, contrasts,
         branch_res[[ct]][[node_name]] <- res_ordered
 
         # Save CSV
-        ct_dir <- file.path(branch_dir, ct)
-        dir.create(ct_dir, showWarnings = FALSE)
+        ct_dir <- file.path(out_dir, ct, "atac_evolutionary")
+        dir.create(ct_dir, showWarnings = FALSE, recursive = TRUE)
         res_df         <- as.data.frame(res_ordered)
         res_df$peak_id <- rownames(res_df)
         res_df <- res_df[, c("peak_id", setdiff(names(res_df), "peak_id"))]
-        write.csv(res_df, file.path(ct_dir, paste0(node_name, ".csv")),
+        write.csv(res_df, file.path(ct_dir, paste0(node_name, "_DA.csv")),
                   row.names = FALSE)
 
         sig_up <- sum(res$padj < 0.05 & res$log2FoldChange > 1, na.rm = TRUE)
-        message(sprintf("  %-35s: %d peaks tested, %d sig UP",
+        message(sprintf("  %-40s: %d peaks tested, %d sig UP",
                         node_name, nrow(node_counts), sig_up))
       }, error = function(e) {
-        message(sprintf("  %-35s: FAILED (%s)", node_name, e$message))
+        message(sprintf("  %-40s: FAILED (%s)", node_name, e$message))
       })
     }
   }
 
-  saveRDS(branch_res, file.path(branch_dir, "branch_res_list.rds"))
+  saveRDS(branch_res, file.path(out_dir, "_summary", "branch_res_list.rds"))
+  save_outlier_summary(outlier_log_df, out_dir)
   message("\nCheckpoint: evolutionary branch results saved.")
   return(branch_res)
 }
@@ -713,8 +889,7 @@ ultra_robust_filter <- function(branch_res, counts_union, meta_shared,
                                 min_logcpm = 1) {
   suppressPackageStartupMessages(library(matrixStats))
 
-  robust_dir <- file.path(out_dir, "differential_results", "ultra_robust_branches")
-  dir.create(robust_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(out_dir, "_summary"), showWarnings = FALSE, recursive = TRUE)
 
   valid_samples <- intersect(rownames(meta_shared), colnames(counts_union))
   counts_union  <- counts_union[, valid_samples, drop = FALSE]
@@ -772,8 +947,8 @@ ultra_robust_filter <- function(branch_res, counts_union, meta_shared,
 
       # Save BED + CSV
       if (length(surviving) > 0) {
-        ct_node_dir <- file.path(robust_dir, ct)
-        dir.create(ct_node_dir, showWarnings = FALSE)
+        ct_node_dir <- file.path(out_dir, ct, "atac_ultra_robust")
+        dir.create(ct_node_dir, showWarnings = FALSE, recursive = TRUE)
 
         out_df <- data.frame(
           peak_id        = surviving,
@@ -781,15 +956,359 @@ ultra_robust_filter <- function(branch_res, counts_union, meta_shared,
           max_neg_logCPM = max_neg[is_robust]
         )
         write.csv(out_df,
-                  file.path(ct_node_dir, paste0(node_name, "_UltraRobust.csv")),
+                  file.path(ct_node_dir, paste0(node_name, "_DA.csv")),
                   row.names = FALSE)
       }
     }
   }
 
-  saveRDS(robust_peaks, file.path(robust_dir, "ultra_robust_peaks_list.rds"))
+  saveRDS(robust_peaks, file.path(out_dir, "_summary", "ultra_robust_peaks_list.rds"))
   message("\nUltra-robust filtering complete. Saved checkpoint.")
   return(robust_peaks)
+}
+
+
+# =============================================================================
+# SECTION 3d: PER-REGION EVOLUTIONARY BRANCH ANALYSIS
+# =============================================================================
+
+#' Run evolutionary branch DESeq2 separately within each anatomical region
+#'
+#' Uses the same orthology-aware peak subsetting and outlier filtering as
+#' run_deseq2_evolutionary(), but restricts samples to one anatomical region
+#' at a time (e.g. "Duodenum", "Colon"). Only adult samples are used.
+#' A lower per-sample cell threshold is applied since per-region pseudobulks
+#' have fewer cells than region-merged ones.
+#'
+#' Input data must NOT have been region-aggregated (region column preserved).
+#'
+#' @param counts_union_regions Union count matrix — samples NOT region-aggregated
+#' @param meta_regions         Metadata with 'region', 'age', 'cell_type', 'species'
+#' @param contrasts            Named list from define_evolutionary_contrasts()
+#' @param ortho_mat            Logical orthology matrix from build_orthology_index()
+#' @param out_dir              Output base directory
+#' @param target_regions       Regions to process (default c("Duodenum", "Colon"))
+#' @param min_samples          Min samples with signal per peak (default 2)
+#' @param min_cells_region     Min cells per pseudobulk for this analysis (default 50)
+#' @param min_counts_region    Min total counts per pseudobulk (default 30000)
+#' @param filter_outliers      Apply per-contrast outlier filtering (default TRUE)
+#' @param sd_thresh            SD threshold for outlier detection (default 2.5)
+#' @return Nested list: region_res[[region]][[cell_type]][[contrast]] = DESeq2 results
+run_deseq2_per_region <- function(counts_union_regions, meta_regions,
+                                  contrasts, ortho_mat, out_dir,
+                                  target_regions    = c("Duodenum", "Colon"),
+                                  min_samples       = 2,
+                                  min_cells_region  = 50,
+                                  min_counts_region = 30000,
+                                  filter_outliers   = TRUE,
+                                  sd_thresh         = 2.5) {
+  suppressPackageStartupMessages({
+    library(DESeq2)
+    library(dplyr)
+  })
+
+  region_res      <- list()
+  all_outlier_log <- data.frame(cell_type = character(), contrast = character(),
+                                sample_id = character(), species = character(),
+                                log2_lib_size = numeric(), region = character(),
+                                stringsAsFactors = FALSE)
+
+  # Enforce: adult samples only
+  meta_regions <- meta_regions[meta_regions$age == "Adult", ]
+  valid_cols   <- intersect(rownames(meta_regions), colnames(counts_union_regions))
+  counts_union_regions <- counts_union_regions[, valid_cols, drop = FALSE]
+  meta_regions         <- meta_regions[valid_cols, ]
+
+  message("Adult samples available: ", nrow(meta_regions))
+  message("Regions in data: ", paste(unique(meta_regions$region), collapse = ", "))
+
+  for (region in target_regions) {
+    message(sprintf("\n\n========== REGION: %s ==========", region))
+
+    region_res[[region]] <- list()
+
+    # ---- Subset to this region ----
+    reg_rows <- rownames(meta_regions)[meta_regions$region == region]
+    if (length(reg_rows) == 0) {
+      message("  No samples found for region: ", region, " — skipping.")
+      next
+    }
+
+    meta_reg   <- meta_regions[reg_rows, ]
+    counts_reg <- counts_union_regions[, reg_rows, drop = FALSE]
+
+    # ---- QC filters for region-level pseudobulks ----
+    meta_reg$total_counts <- colSums(counts_reg)
+    keep_qc <- meta_reg$total_counts >= min_counts_region
+    if ("n_cells" %in% colnames(meta_reg)) {
+      keep_qc <- keep_qc & (meta_reg$n_cells >= min_cells_region)
+    }
+    meta_reg   <- meta_reg[keep_qc, ]
+    counts_reg <- counts_reg[, rownames(meta_reg), drop = FALSE]
+    message(sprintf("  After QC: %d samples (counts >= %d, cells >= %d)",
+                    nrow(meta_reg), min_counts_region, min_cells_region))
+
+    # ---- Cell types present in this region ----
+    cell_types_reg <- sort(unique(as.character(meta_reg$cell_type)))
+
+    for (ct in cell_types_reg) {
+      meta_ct    <- meta_reg[meta_reg$cell_type == ct, ]
+      ct_samples <- rownames(meta_ct)
+      counts_ct  <- counts_reg[, ct_samples, drop = FALSE]
+
+      region_res[[region]][[ct]] <- list()
+
+      for (node_name in names(contrasts)) {
+        pos_sp <- contrasts[[node_name]]$pos
+        neg_sp <- contrasts[[node_name]]$neg
+        req_sp <- c(pos_sp, neg_sp)
+
+        avail_sp <- unique(as.character(meta_ct$species))
+        if (length(setdiff(req_sp, avail_sp)) > 0) next
+
+        node_samples <- ct_samples[meta_ct$species %in% req_sp]
+        if (length(node_samples) < 4) next
+
+        node_meta <- meta_ct[node_samples, ]
+        node_meta$species <- factor(node_meta$species)
+
+        # Orthology-aware peak subsetting
+        valid_peaks <- rownames(ortho_mat)[
+          rowSums(ortho_mat[, req_sp, drop = FALSE]) == length(req_sp)
+        ]
+        valid_peaks <- intersect(valid_peaks, rownames(counts_ct))
+        node_counts <- counts_ct[valid_peaks, node_samples, drop = FALSE]
+
+        # Per-contrast outlier filtering
+        if (filter_outliers) {
+          outlier_flags <- detect_per_contrast_outliers(node_counts, node_meta,
+                                                        sd_thresh = sd_thresh)
+          removed_ids <- names(outlier_flags)[outlier_flags]
+          if (length(removed_ids) > 0) {
+            lib_vec  <- log2(colSums(node_counts) + 1)
+            new_rows <- append_outlier_log(data.frame(), ct, node_name,
+                                           removed_ids, node_meta, lib_vec)
+            new_rows$region    <- region
+            all_outlier_log    <- rbind(all_outlier_log, new_rows)
+            keep_samp   <- node_samples[!outlier_flags[node_samples]]
+            node_meta   <- node_meta[keep_samp, ]
+            node_counts <- node_counts[, keep_samp, drop = FALSE]
+            node_meta$species <- droplevels(node_meta$species)
+          }
+          if (ncol(node_counts) < 4) next
+        }
+
+        # Active peak filter
+        keep <- rowSums(node_counts >= 10) >= min_samples
+        node_counts <- node_counts[keep, , drop = FALSE]
+        if (nrow(node_counts) < 50) next
+
+        tryCatch({
+          dds <- DESeqDataSetFromMatrix(
+            countData = round(node_counts),
+            colData   = node_meta,
+            design    = ~ 0 + species
+          )
+          dds <- estimateSizeFactors(dds, type = "poscounts")
+          dds <- DESeq(dds, quiet = TRUE)
+
+          res_names    <- resultsNames(dds)
+          contrast_vec <- make_contrast_vector(pos_sp, neg_sp, res_names)
+          res          <- results(dds, contrast = contrast_vec, alpha = 0.05)
+          res_ordered  <- res[order(res$padj), ]
+
+          region_res[[region]][[ct]][[node_name]] <- res_ordered
+
+          # Save CSV
+          ct_dir <- file.path(out_dir, ct, "atac_region")
+          dir.create(ct_dir, showWarnings = FALSE, recursive = TRUE)
+          res_df         <- as.data.frame(res_ordered)
+          res_df$peak_id <- rownames(res_df)
+          res_df <- res_df[, c("peak_id", setdiff(names(res_df), "peak_id"))]
+          write.csv(res_df, file.path(ct_dir, paste0(region, "_", node_name, "_DA.csv")),
+                    row.names = FALSE)
+
+          sig_up <- sum(res$padj < 0.05 & res$log2FoldChange > 1, na.rm = TRUE)
+          message(sprintf("  [%s | %s] %-40s: %d peaks, %d sig UP",
+                          region, ct, node_name, nrow(node_counts), sig_up))
+        }, error = function(e) {
+          message(sprintf("  [%s | %s] %-40s: FAILED (%s)",
+                          region, ct, node_name, e$message))
+        })
+      }
+    }
+  }
+
+  # ---- Save outputs ----
+  saveRDS(region_res, file.path(out_dir, "_summary", "region_res_list.rds"))
+
+  if (nrow(all_outlier_log) > 0) {
+    write.csv(all_outlier_log,
+              file.path(out_dir, "_summary", "outlier_region_DA.csv"),
+              row.names = FALSE)
+    message("\nRegion outlier log: ", nrow(all_outlier_log), " removals saved.")
+  }
+
+  message("\nPer-region DESeq2 complete.")
+  return(region_res)
+}
+
+
+#' Build a region-comparison summary table for one contrast and cell type
+#'
+#' For a given contrast, reports which peaks are significant in Duodenum only,
+#' Colon only, or both, with their log2FC values in each region.
+#'
+#' @param region_res     Output from run_deseq2_per_region()
+#' @param cell_type      Cell type to query
+#' @param contrast       Contrast name
+#' @param padj_thresh    Significance threshold (default 0.05)
+#' @param lfc_thresh     Log2FC threshold (default 1)
+#' @return data.frame with columns: peak_id, sig_duodenum, sig_colon,
+#'         lfc_duodenum, lfc_colon, category
+compare_regions <- function(region_res, cell_type, contrast,
+                            padj_thresh = 0.05, lfc_thresh = 1) {
+  regions <- names(region_res)
+  res_list <- lapply(regions, function(rg) {
+    r <- region_res[[rg]][[cell_type]][[contrast]]
+    if (is.null(r)) return(NULL)
+    df <- as.data.frame(r)
+    df$peak_id <- rownames(df)
+    df
+  })
+  names(res_list) <- regions
+
+  res_list <- Filter(Negate(is.null), res_list)
+  if (length(res_list) < 2) {
+    message("Need results from at least 2 regions.")
+    return(invisible(NULL))
+  }
+
+  all_peaks <- Reduce(union, lapply(res_list, function(x) x$peak_id))
+  out_df    <- data.frame(peak_id = all_peaks, stringsAsFactors = FALSE)
+
+  for (rg in names(res_list)) {
+    df <- res_list[[rg]]
+    rownames(df) <- df$peak_id
+    lfc_col  <- paste0("lfc_", tolower(rg))
+    padj_col <- paste0("padj_", tolower(rg))
+    sig_col  <- paste0("sig_", tolower(rg))
+
+    out_df[[lfc_col]]  <- df[out_df$peak_id, "log2FoldChange"]
+    out_df[[padj_col]] <- df[out_df$peak_id, "padj"]
+    out_df[[sig_col]]  <- !is.na(out_df[[padj_col]]) &
+                          out_df[[padj_col]] < padj_thresh &
+                          !is.na(out_df[[lfc_col]]) &
+                          out_df[[lfc_col]] > lfc_thresh
+  }
+
+  rg_names  <- names(res_list)
+  sig_cols  <- paste0("sig_", tolower(rg_names))
+  sig_mat   <- as.matrix(out_df[, sig_cols, drop = FALSE])
+  out_df$n_regions_sig <- rowSums(sig_mat, na.rm = TRUE)
+  out_df$category <- apply(sig_mat, 1, function(x) {
+    which_sig <- rg_names[which(x)]
+    if (length(which_sig) == 0) "Neither"
+    else if (length(which_sig) == length(rg_names)) "Both"
+    else paste0(which_sig, "_only")
+  })
+
+  out_df <- out_df[out_df$n_regions_sig > 0, ]
+  out_df <- out_df[order(-out_df$n_regions_sig), ]
+  return(out_df)
+}
+
+
+#' Plot a region-comparison heatmap (signed p-value per region) for one cell type
+#'
+#' Shows peaks significant in either region, colored by signed -log10(padj).
+#' Columns are region × contrast combinations; rows are peaks.
+#'
+#' @param region_res   Output from run_deseq2_per_region()
+#' @param cell_type    Cell type to plot
+#' @param out_file     Output PDF path
+#' @param padj_thresh  Significance threshold
+#' @param lfc_thresh   Log2FC threshold
+plot_region_comparison_heatmap <- function(region_res, cell_type, out_file,
+                                           padj_thresh = 0.05, lfc_thresh = 1,
+                                           max_peaks = 2000) {
+  suppressPackageStartupMessages({
+    library(ComplexHeatmap)
+    library(circlize)
+  })
+
+  regions    <- names(region_res)
+  contrasts  <- unique(unlist(lapply(region_res, function(rg) names(rg[[cell_type]]))))
+  contrasts  <- contrasts[!is.null(contrasts)]
+
+  # Build signed-p matrix: rows = peaks, columns = region_contrast
+  sig_peaks_all <- c()
+  col_data      <- list()
+
+  for (rg in regions) {
+    for (cn in contrasts) {
+      r <- region_res[[rg]][[cell_type]][[cn]]
+      if (is.null(r)) next
+      df <- as.data.frame(r)
+      sig_idx <- which(!is.na(df$padj) & df$padj < padj_thresh &
+                         df$log2FoldChange > lfc_thresh)
+      if (length(sig_idx) > 0)
+        sig_peaks_all <- c(sig_peaks_all, rownames(df)[sig_idx])
+      padj_safe <- df$padj; padj_safe[is.na(padj_safe)] <- 1
+      padj_safe[padj_safe == 0] <- 1e-300
+      col_vals <- df$log2FoldChange * -log10(padj_safe)
+      col_data[[paste0(rg, "_", cn)]] <- setNames(col_vals, rownames(df))
+    }
+  }
+
+  sig_peaks_all <- unique(sig_peaks_all)
+  if (length(sig_peaks_all) == 0) {
+    message("No significant peaks for region comparison: ", cell_type)
+    return(invisible(NULL))
+  }
+
+  # Subsample to max_peaks by highest absolute signed p-value sum across columns
+  if (length(sig_peaks_all) > max_peaks) {
+    message("  Subsampling ", length(sig_peaks_all), " → ", max_peaks,
+            " peaks for region comparison heatmap")
+    all_vals <- lapply(col_data, function(v) abs(v[sig_peaks_all]))
+    score_mat <- do.call(cbind, all_vals)
+    row_scores <- rowSums(score_mat, na.rm = TRUE)
+    sig_peaks_all <- sig_peaks_all[order(row_scores, decreasing = TRUE)[seq_len(max_peaks)]]
+  }
+
+  mat <- matrix(0, nrow = length(sig_peaks_all), ncol = length(col_data),
+                dimnames = list(sig_peaks_all, names(col_data)))
+  for (cn in names(col_data)) {
+    common <- intersect(sig_peaks_all, names(col_data[[cn]]))
+    mat[common, cn] <- col_data[[cn]][common]
+  }
+
+  cap_val <- quantile(abs(mat), 0.99, na.rm = TRUE)
+  mat[mat >  cap_val] <-  cap_val
+  mat[mat < -cap_val] <- -cap_val
+
+  col_fun <- colorRamp2(c(-cap_val, 0, cap_val),
+                        c("#377eb8", "white", "#e41a1c"))
+
+  ht <- Heatmap(mat,
+                name             = "Signed\n-log10(padj)",
+                col              = col_fun,
+                cluster_rows     = TRUE,
+                cluster_columns  = FALSE,
+                show_row_names   = FALSE,
+                column_names_rot = 45,
+                column_names_gp  = gpar(fontsize = 8),
+                column_title     = paste("Region Comparison:", cell_type),
+                column_title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                border           = TRUE)
+
+  dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
+  pdf(out_file, width = max(10, length(col_data) * 0.4 + 4),
+      height = max(8, length(sig_peaks_all) * 0.01 + 4))
+  draw(ht, merge_legend = TRUE)
+  dev.off()
+  message("Region comparison heatmap saved: ", basename(out_file))
 }
 
 
@@ -983,6 +1502,169 @@ plot_volcano <- function(res_df, title, out_file,
 
 
 # =============================================================================
+# SECTION 5b: ACCESSIBILITY DOTPLOT
+# =============================================================================
+
+#' Plot per-species accessibility for a set of peaks as a species-level dotplot
+#'
+#' For each peak, shows mean log2CPM per species (dot size = n donors, color =
+#' mean log2CPM). Peaks are clustered by their species accessibility profile.
+#' Useful for inspecting top hits from differential analysis.
+#'
+#' @param peak_ids     Character vector of peak IDs to plot
+#' @param counts       Count matrix (peaks x samples)
+#' @param meta         Metadata with 'species' and 'donor' columns
+#' @param out_file     Output PDF path
+#' @param title        Plot title
+#' @param species_order Species order for x-axis
+#' @param max_peaks    Cap for number of peaks to show (default 60)
+plot_accessibility_dotplot <- function(peak_ids, counts, meta, out_file,
+                                       title = "Accessibility per Species",
+                                       species_order = c("Human", "Chimpanzee",
+                                                          "Bonobo", "Gorilla",
+                                                          "Macaque", "Marmoset"),
+                                       max_peaks = 60) {
+  suppressPackageStartupMessages({
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+  })
+
+  peak_ids <- intersect(peak_ids, rownames(counts))
+  if (length(peak_ids) == 0) {
+    message("No peaks found in counts matrix for dotplot.")
+    return(invisible(NULL))
+  }
+  if (length(peak_ids) > max_peaks) {
+    peak_ids <- peak_ids[1:max_peaks]
+    message("  Dotplot: capping at ", max_peaks, " peaks")
+  }
+
+  # Compute log2CPM
+  lib_sizes  <- colSums(counts)
+  cpm_mat    <- t(t(counts[peak_ids, , drop = FALSE]) / lib_sizes) * 1e6
+  logcpm_mat <- log2(cpm_mat + 1)
+
+  # Build long data frame
+  long_df <- as.data.frame(logcpm_mat) %>%
+    tibble::rownames_to_column("peak_id") %>%
+    tidyr::pivot_longer(-peak_id, names_to = "sample_id", values_to = "logcpm") %>%
+    dplyr::left_join(data.frame(sample_id = rownames(meta),
+                                species   = as.character(meta$species),
+                                stringsAsFactors = FALSE),
+                     by = "sample_id")
+
+  # Summarise per peak × species
+  sum_df <- long_df %>%
+    group_by(peak_id, species) %>%
+    summarize(mean_logcpm = mean(logcpm, na.rm = TRUE),
+              n_donors    = n(),
+              .groups = "drop")
+
+  # Order species
+  present_sp  <- intersect(species_order, unique(sum_df$species))
+  sum_df$species <- factor(sum_df$species, levels = present_sp)
+
+  # Cluster peaks by their mean-logcpm vector
+  wide_mat <- sum_df %>%
+    pivot_wider(id_cols = peak_id, names_from = species,
+                values_from = mean_logcpm, values_fill = 0) %>%
+    tibble::column_to_rownames("peak_id")
+  if (nrow(wide_mat) > 1) {
+    peak_order <- rownames(wide_mat)[
+      hclust(dist(wide_mat))$order
+    ]
+  } else {
+    peak_order <- rownames(wide_mat)
+  }
+  sum_df$peak_id <- factor(sum_df$peak_id, levels = peak_order)
+
+  p <- ggplot(sum_df, aes(x = species, y = peak_id,
+                          size = n_donors, color = mean_logcpm)) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradient2(low  = "#2166ac", mid = "#f7f7f7", high = "#d73027",
+                          midpoint = median(sum_df$mean_logcpm, na.rm = TRUE),
+                          name = "Mean\nlog2CPM") +
+    scale_size_continuous(range = c(1.5, 6), name = "N donors") +
+    theme_bw() +
+    theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 11),
+          axis.text.y  = element_text(size = 5),
+          panel.grid.major = element_line(color = "grey92"),
+          plot.title   = element_text(face = "bold", size = 13)) +
+    labs(title = title, x = NULL, y = "Peak ID")
+
+  dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
+  dynamic_h <- max(6, length(peak_order) * 0.12 + 2)
+  ggsave(out_file, p, width = 8, height = dynamic_h, limitsize = FALSE)
+  message("  Accessibility dotplot saved: ", basename(out_file))
+  invisible(p)
+}
+
+
+#' Strip-plot of per-donor log2CPM for a single peak, grouped by species
+#'
+#' Shows raw data points (one per donor) plus mean ± SD. Useful for inspecting
+#' individual top hits and confirming they pass the ultra-robust filter visually.
+#'
+#' @param peak_id   Single peak ID
+#' @param counts    Count matrix
+#' @param meta      Metadata with 'species' and 'donor'
+#' @param out_file  Output PDF path (or NULL to return plot)
+#' @param title     Plot title (default = peak_id)
+#' @param species_order Species order for x-axis
+plot_peak_strip <- function(peak_id, counts, meta, out_file = NULL,
+                             title = NULL,
+                             species_order = c("Human", "Chimpanzee", "Bonobo",
+                                               "Gorilla", "Macaque", "Marmoset")) {
+  suppressPackageStartupMessages({
+    library(ggplot2)
+    library(dplyr)
+  })
+
+  if (!peak_id %in% rownames(counts)) {
+    message("Peak not found: ", peak_id)
+    return(invisible(NULL))
+  }
+
+  lib_sizes <- colSums(counts)
+  cpm       <- counts[peak_id, ] / lib_sizes * 1e6
+  logcpm    <- log2(cpm + 1)
+
+  df <- data.frame(sample_id = names(logcpm),
+                   logcpm    = as.numeric(logcpm),
+                   species   = as.character(meta[names(logcpm), "species"]),
+                   stringsAsFactors = FALSE)
+  present_sp <- intersect(species_order, unique(df$species))
+  df$species <- factor(df$species, levels = present_sp)
+
+  # Summarise for mean ± SD overlay
+  sum_df <- df %>%
+    group_by(species) %>%
+    summarize(mean_val = mean(logcpm), sd_val = sd(logcpm), .groups = "drop")
+
+  p <- ggplot(df, aes(x = species, y = logcpm, color = species)) +
+    geom_jitter(width = 0.15, size = 2.5, alpha = 0.8) +
+    geom_crossbar(data = sum_df,
+                  aes(x = species, y = mean_val,
+                      ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                  width = 0.4, color = "black", fill = NA, fatten = 2) +
+    theme_bw() +
+    theme(legend.position  = "none",
+          axis.text.x      = element_text(angle = 45, hjust = 1, size = 11),
+          plot.title       = element_text(face = "bold", size = 12)) +
+    labs(title = if (is.null(title)) peak_id else title,
+         x = NULL, y = "log2(CPM + 1)")
+
+  if (!is.null(out_file)) {
+    dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
+    ggsave(out_file, p, width = 6, height = 4)
+    message("  Strip plot saved: ", basename(out_file))
+  }
+  invisible(p)
+}
+
+
+# =============================================================================
 # SECTION 6: HEATMAPS
 # =============================================================================
 
@@ -1160,7 +1842,7 @@ extract_kmeans_modules <- function(plot_mat, num_modules = 40,
     library(circlize)
   })
 
-  cluster_dir <- file.path(out_dir, "differential_results", "cross_celltype_modules")
+  cluster_dir <- file.path(out_dir, "_summary", "cross_celltype_modules")
   dir.create(cluster_dir, showWarnings = FALSE, recursive = TRUE)
 
   set.seed(seed)
@@ -1274,14 +1956,16 @@ extract_kmeans_modules <- function(plot_mat, num_modules = 40,
 #' @param genes     Character vector of gene symbols
 #' @param label     Label for this analysis (used in filenames)
 #' @param out_dir   Directory to save results
+#' @param universe  Character vector of background gene symbols (all tested genes).
+#'                  If NULL, defaults to all annotated genes in org.Hs.eg.db.
 #' @return enrichResult object (or NULL)
-run_go_enrichment <- function(genes, label, out_dir) {
+run_go_enrichment <- function(genes, label, out_dir, universe = NULL) {
   suppressPackageStartupMessages({
     library(clusterProfiler)
     library(org.Hs.eg.db)
   })
 
-  enrich_dir <- file.path(out_dir, "differential_results", "enrichment")
+  enrich_dir <- file.path(out_dir, "enrichment")
   dir.create(enrich_dir, showWarnings = FALSE, recursive = TRUE)
 
   genes <- unique(genes[genes != "." & !is.na(genes)])
@@ -1290,7 +1974,10 @@ run_go_enrichment <- function(genes, label, out_dir) {
     return(invisible(NULL))
   }
 
+  universe <- if (!is.null(universe)) unique(universe[universe != "." & !is.na(universe)]) else NULL
+
   ego <- enrichGO(gene          = genes,
+                  universe      = universe,
                   OrgDb         = org.Hs.eg.db,
                   keyType       = "SYMBOL",
                   ont           = "BP",
@@ -1312,6 +1999,179 @@ run_go_enrichment <- function(genes, label, out_dir) {
 }
 
 
+#' Run disease and pathway enrichment (KEGG, Disease Ontology, DisGeNET, Cancer genes)
+#'
+#' @param genes       Character vector of gene symbols
+#' @param label       Label for this analysis (used in filenames)
+#' @param out_dir     Directory to save results
+#' @param padj_cutoff FDR threshold (default 0.05)
+#' @param universe    Character vector of background gene symbols (all tested genes).
+#'                    If NULL, defaults to all annotated genes in org.Hs.eg.db.
+#' @return Named list of enrichResult objects (kegg, do, dgn, ncg)
+run_disease_enrichment <- function(genes, label, out_dir, padj_cutoff = 0.05,
+                                   universe = NULL) {
+  suppressPackageStartupMessages({
+    library(clusterProfiler)
+    library(DOSE)
+    library(org.Hs.eg.db)
+    library(enrichplot)
+    library(ggplot2)
+  })
+
+  enrich_dir <- file.path(out_dir, "enrichment")
+  dir.create(enrich_dir, showWarnings = FALSE, recursive = TRUE)
+
+  genes <- unique(genes[genes != "." & !is.na(genes) & genes != ""])
+  if (length(genes) < 5) {
+    message("  Too few genes for disease enrichment: ", label, " (", length(genes), ")")
+    return(invisible(NULL))
+  }
+
+  # Convert SYMBOL → ENTREZID (required for KEGG, DOSE, DisGeNET)
+  id_map <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID",
+                 OrgDb = org.Hs.eg.db, drop = TRUE)
+  entrez <- unique(id_map$ENTREZID)
+  message("  ", label, ": ", length(genes), " symbols → ", length(entrez), " ENTREZ IDs")
+
+  # Convert universe SYMBOL → ENTREZID if provided
+  universe_entrez <- NULL
+  if (!is.null(universe)) {
+    universe <- unique(universe[universe != "." & !is.na(universe) & universe != ""])
+    uni_map  <- tryCatch(
+      bitr(universe, fromType = "SYMBOL", toType = "ENTREZID",
+           OrgDb = org.Hs.eg.db, drop = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(uni_map)) universe_entrez <- unique(uni_map$ENTREZID)
+    message("  Universe: ", length(universe), " symbols → ",
+            length(universe_entrez), " ENTREZ IDs")
+  }
+
+  results <- list()
+
+  # Helper: save result and dotplot
+  save_enrich <- function(er, tag) {
+    if (!is.null(er) && nrow(er) > 0) {
+      er_readable <- tryCatch(setReadable(er, OrgDb = org.Hs.eg.db, keyType = "ENTREZID"),
+                              error = function(e) er)
+      write.csv(as.data.frame(er_readable),
+                file.path(enrich_dir, paste0(label, "_", tag, ".csv")),
+                row.names = FALSE)
+      p <- dotplot(er_readable, showCategory = 15) +
+        ggtitle(paste(label, gsub("_", " ", tag))) +
+        theme(axis.text.y = element_text(size = 8))
+      ggsave(file.path(enrich_dir, paste0(label, "_", tag, "_dotplot.pdf")),
+             p, width = 9, height = 7)
+      message("    [OK] ", tag, ": ", nrow(er), " terms")
+      return(er_readable)
+    } else {
+      message("    [--] ", tag, ": no significant terms")
+      return(NULL)
+    }
+  }
+
+  # 1. KEGG pathways
+  results$kegg <- tryCatch({
+    er <- enrichKEGG(gene          = entrez,
+                     universe      = universe_entrez,
+                     organism      = "hsa",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = padj_cutoff)
+    save_enrich(er, "KEGG_Pathways")
+  }, error = function(e) { message("    [!] KEGG failed: ", e$message); NULL })
+
+  # 2. Disease Ontology (DO)
+  results$do <- tryCatch({
+    er <- enrichDO(gene          = entrez,
+                   universe      = universe_entrez,
+                   ont           = "DO",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = padj_cutoff,
+                   readable      = TRUE)
+    save_enrich(er, "Disease_Ontology")
+  }, error = function(e) { message("    [!] DO failed: ", e$message); NULL })
+
+  # 3. DisGeNET (curated disease–gene associations)
+  results$dgn <- tryCatch({
+    er <- enrichDGN(gene          = entrez,
+                    universe      = universe_entrez,
+                    pAdjustMethod = "BH",
+                    pvalueCutoff  = padj_cutoff,
+                    readable      = TRUE)
+    save_enrich(er, "DisGeNET")
+  }, error = function(e) { message("    [!] DisGeNET failed: ", e$message); NULL })
+
+  # 4. Network of Cancer Genes (NCG)
+  results$ncg <- tryCatch({
+    er <- enrichNCG(gene          = entrez,
+                    universe      = universe_entrez,
+                    pAdjustMethod = "BH",
+                    pvalueCutoff  = padj_cutoff,
+                    readable      = TRUE)
+    save_enrich(er, "Cancer_Genes")
+  }, error = function(e) { message("    [!] NCG failed: ", e$message); NULL })
+
+  # Combined summary table: top 5 terms per database
+  summary_rows <- list()
+  db_labels <- c(kegg = "KEGG", do = "DiseaseOntology", dgn = "DisGeNET", ncg = "CancerGenes")
+  for (db in names(db_labels)) {
+    er <- results[[db]]
+    if (!is.null(er) && nrow(er) > 0) {
+      df <- as.data.frame(er)[1:min(5, nrow(er)), c("Description", "GeneRatio", "p.adjust")]
+      df$Database <- db_labels[[db]]
+      df$Label    <- label
+      summary_rows[[db]] <- df
+    }
+  }
+  if (length(summary_rows) > 0) {
+    summary_df <- do.call(rbind, summary_rows)
+    write.csv(summary_df,
+              file.path(enrich_dir, paste0(label, "_top_disease_terms.csv")),
+              row.names = FALSE)
+  }
+
+  return(invisible(results))
+}
+
+
+#' Run GO + disease enrichment together (convenience wrapper)
+#'
+#' @param peaks          Character vector of significant peak IDs
+#' @param species        Species for gene lookup (default "Human")
+#' @param label          Label prefix for filenames
+#' @param out_dir        Output directory
+#' @param anno_df        Master annotation data.frame
+#' @param ct             Cell type name (used to route output to {out_dir}/{ct}/enrichment/)
+#' @param universe_peaks Character vector of ALL tested peak IDs for this contrast
+#'                       (used as enrichment background). If NULL, defaults to all
+#'                       annotated genes in org.Hs.eg.db — too broad; always pass this.
+run_full_enrichment <- function(peaks, species = "Human", label, out_dir, anno_df,
+                                ct = NULL, universe_peaks = NULL) {
+  if (length(peaks) < 5) {
+    message("  Skipping enrichment for ", label, ": too few peaks (", length(peaks), ")")
+    return(invisible(NULL))
+  }
+  genes <- get_peak_info(peaks, species, "gene", anno_df)$gene
+  genes <- unique(genes[genes != "." & !is.na(genes) & genes != ""])
+
+  # Build universe from all tested peaks
+  universe_genes <- NULL
+  if (!is.null(universe_peaks) && length(universe_peaks) > 0) {
+    ug <- get_peak_info(universe_peaks, species, "gene", anno_df)$gene
+    universe_genes <- unique(ug[ug != "." & !is.na(ug) & ug != ""])
+  }
+
+  ct_out_dir <- if (!is.null(ct)) file.path(out_dir, ct) else out_dir
+  message("\n--- Enrichment: ", label, " (", length(peaks), " peaks, ",
+          length(genes), " genes; universe: ",
+          if (is.null(universe_genes)) "org.Hs.eg.db default" else paste0(length(universe_genes), " genes"),
+          ") ---")
+  go_res      <- run_go_enrichment(genes, label, ct_out_dir, universe = universe_genes)
+  disease_res <- run_disease_enrichment(genes, label, ct_out_dir, universe = universe_genes)
+  invisible(list(go = go_res, disease = disease_res))
+}
+
+
 #' Run GREAT analysis for a set of peak coordinates
 #'
 #' @param peak_ids  Character vector of peak IDs
@@ -1324,7 +2184,7 @@ run_great_analysis <- function(peak_ids, species, anno_df, label, out_dir,
                                genome = "hg38") {
   suppressPackageStartupMessages(library(rGREAT))
 
-  enrich_dir <- file.path(out_dir, "differential_results", "enrichment")
+  enrich_dir <- file.path(out_dir, "enrichment")
   dir.create(enrich_dir, showWarnings = FALSE, recursive = TRUE)
 
   coords <- get_peak_info(peak_ids, species, "coordinates", anno_df)
@@ -1466,7 +2326,6 @@ run_parallel_motif_enrichment <- function(peak_list_named, anno_df,
     }
 
     return(se_enrich)
-  }
 }
 
 
@@ -1545,4 +2404,465 @@ plot_count_distribution <- function(meta, out_file,
   dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
   ggsave(out_file, p, width = 10, height = 6)
   message("  Count distribution plot saved.")
+}
+
+
+# =============================================================================
+# SECTION 11: RNA PSEUDOBULK DESeq2
+# =============================================================================
+# Mirrors the ATAC pseudobulk pipeline but loads from parquet files produced
+# by scripts/create_rna_pseudobulk.py (generated from the merged h5ad).
+#
+# Pseudobulk unit: Individual × cell_type × Region  (non-aggregated)
+#                  Individual × cell_type            (region-aggregated, default)
+# Design: ~ 0 + species (same no-intercept model as ATAC)
+# ==============================================================================
+
+#' Load RNA pseudobulk data from parquet files generated by create_rna_pseudobulk.py
+#'
+#' @param pb_dir   Root directory with per-species subdirs (each has
+#'                 pseudobulk_counts.parquet + pseudobulk_meta.parquet)
+#' @param species  Character vector of species to load
+#' @return list(all_counts = list(species -> matrix), all_meta = list(species -> df))
+load_rna_pseudobulk <- function(pb_dir, species) {
+  suppressPackageStartupMessages(library(arrow))
+
+  all_counts <- list()
+  all_meta   <- list()
+
+  for (sp in species) {
+    sp_dir     <- file.path(pb_dir, sp)
+    counts_f   <- file.path(sp_dir, "pseudobulk_counts.parquet")
+    meta_f     <- file.path(sp_dir, "pseudobulk_meta.parquet")
+
+    if (!file.exists(counts_f) || !file.exists(meta_f)) {
+      message("Skipping ", sp, ": files not found at ", sp_dir)
+      next
+    }
+
+    counts_mat <- as.data.frame(read_parquet(counts_f))
+    meta_df    <- as.data.frame(read_parquet(meta_f))
+
+    # counts: rows=genes, cols=sample_ids (from parquet index)
+    # Restore row names from the first column if it was saved as data column
+    if (!is.null(counts_mat[["__index_level_0__"]])) {
+      rownames(counts_mat) <- counts_mat[["__index_level_0__"]]
+      counts_mat[["__index_level_0__"]] <- NULL
+    }
+    counts_mat <- as.matrix(counts_mat)
+    storage.mode(counts_mat) <- "integer"
+
+    # Meta: index is sample_id
+    if (!is.null(meta_df[["sample_id"]])) {
+      rownames(meta_df) <- meta_df[["sample_id"]]
+    }
+
+    # Align columns
+    shared_samples <- intersect(colnames(counts_mat), rownames(meta_df))
+    counts_mat <- counts_mat[, shared_samples, drop = FALSE]
+    meta_df    <- meta_df[shared_samples, , drop = FALSE]
+
+    all_counts[[sp]] <- counts_mat
+    all_meta[[sp]]   <- meta_df
+    message("Loaded ", sp, ": ", nrow(counts_mat), " genes x ", ncol(counts_mat), " samples")
+  }
+  return(list(all_counts = all_counts, all_meta = all_meta))
+}
+
+
+#' Merge RNA pseudobulk matrices across species (inner = shared genes)
+#'
+#' @param all_counts Named list of count matrices (genes × samples)
+#' @param all_meta   Named list of metadata data.frames
+#' @return list(counts = merged_matrix, meta = merged_meta)
+merge_rna_pseudobulk <- function(all_counts, all_meta, join_type = "inner") {
+  if (join_type == "inner") {
+    shared_genes <- Reduce(intersect, lapply(all_counts, rownames))
+    message("Inner join: ", length(shared_genes), " shared genes")
+  } else {
+    shared_genes <- Reduce(union, lapply(all_counts, rownames))
+    message("Union join: ", length(shared_genes), " total genes")
+  }
+
+  mats <- lapply(all_counts, function(m) {
+    missing <- setdiff(shared_genes, rownames(m))
+    if (length(missing) > 0) {
+      pad <- matrix(0L, nrow = length(missing), ncol = ncol(m),
+                    dimnames = list(missing, colnames(m)))
+      m <- rbind(m[intersect(shared_genes, rownames(m)), , drop = FALSE], pad)
+    }
+    m[shared_genes, , drop = FALSE]
+  })
+
+  merged_counts <- do.call(cbind, unname(mats))
+  # unname() prevents do.call(rbind/cbind) from prefixing dimension names with list element names
+  merged_meta   <- do.call(rbind, unname(all_meta))
+  # Restore rownames from sample_id column if needed
+  if (!is.null(merged_meta[["sample_id"]]) &&
+      !identical(rownames(merged_meta), as.character(merged_meta[["sample_id"]]))) {
+    rownames(merged_meta) <- as.character(merged_meta[["sample_id"]])
+  }
+  merged_meta$species <- factor(merged_meta$species)
+
+  message("Merged RNA matrix: ", nrow(merged_counts), " genes x ", ncol(merged_counts), " samples")
+  return(list(counts = merged_counts, meta = merged_meta))
+}
+
+
+#' Aggregate RNA pseudobulk across regions (sum counts, merge metadata)
+#'
+#' Collapses Individual × cell_type × Region → Individual × cell_type
+#' by summing counts and summing n_cells.
+#'
+#' @param counts  Genes × samples count matrix
+#' @param meta    Samples × metadata data.frame (must have donor, cell_type, species)
+#' @return list(counts, meta)
+aggregate_rna_pseudobulk <- function(counts, meta) {
+  meta$agg_key <- paste(meta$donor, meta$cell_type, meta$species, sep = "__")
+  keys <- unique(meta$agg_key)
+
+  new_counts <- matrix(0L, nrow = nrow(counts), ncol = length(keys),
+                       dimnames = list(rownames(counts), keys))
+  n_keys     <- length(keys)
+  new_meta   <- data.frame(
+    donor     = rep(NA_character_, n_keys),
+    cell_type = rep(NA_character_, n_keys),
+    species   = rep(NA_character_, n_keys),
+    n_cells   = rep(0L,            n_keys),
+    n_counts  = rep(0L,            n_keys),
+    row.names = keys,
+    stringsAsFactors = FALSE
+  )
+
+  for (k in keys) {
+    cols <- rownames(meta)[meta$agg_key == k]
+    new_counts[, k] <- rowSums(counts[, cols, drop = FALSE])
+    m0 <- meta[cols[1], , drop = FALSE]
+    new_meta[k, "donor"]     <- as.character(m0$donor)
+    new_meta[k, "cell_type"] <- as.character(m0$cell_type)
+    new_meta[k, "species"]   <- as.character(m0$species)
+    new_meta[k, "n_cells"]   <- sum(meta[cols, "n_cells"], na.rm = TRUE)
+    new_meta[k, "n_counts"]  <- sum(new_counts[, k])
+  }
+  storage.mode(new_counts) <- "integer"
+  return(list(counts = new_counts, meta = new_meta))
+}
+
+
+#' Run DESeq2 on RNA pseudobulk for evolutionary contrasts
+#'
+#' Replicates run_deseq2_evolutionary() but for RNA expression.
+#' Uses the same no-intercept design, per-contrast orthology subsetting is skipped
+#' (all genes are shared by construction from the inner-join merge).
+#'
+#' @param counts_rna    Genes × samples integer count matrix
+#' @param meta_rna      Sample metadata (must have species, cell_type columns)
+#' @param evo_contrasts Named list of pos/neg species vectors (from define_evolutionary_contrasts())
+#' @param out_dir       Base output directory
+#' @param min_samples   Minimum samples per species group (default 2)
+#' @param filter_outliers  Apply per-contrast outlier detection (default TRUE)
+#' @return Nested list: cell_type → contrast → DESeqResults
+run_deseq2_rna_evolutionary <- function(counts_rna, meta_rna, evo_contrasts, out_dir,
+                                        min_samples = 2, filter_outliers = TRUE,
+                                        sd_thresh = 2.5) {
+  suppressPackageStartupMessages(library(DESeq2))
+
+  dir.create(file.path(out_dir, "_summary"), showWarnings = FALSE, recursive = TRUE)
+
+  meta_rna$species   <- as.character(meta_rna$species)
+  meta_rna$cell_type <- make.names(as.character(meta_rna$cell_type))
+  cell_types <- unique(meta_rna$cell_type)
+
+  results <- list()
+
+  for (ct in cell_types) {
+    ct_idx    <- rownames(meta_rna)[meta_rna$cell_type == ct]
+    ct_counts <- counts_rna[, ct_idx, drop = FALSE]
+    ct_meta   <- meta_rna[ct_idx, , drop = FALSE]
+
+    message("\n=== [RNA] ", ct, " ===")
+
+    # Remove all-zero genes for this cell type
+    keep_genes <- rowSums(ct_counts) > 0
+    ct_counts  <- ct_counts[keep_genes, , drop = FALSE]
+
+    results[[ct]] <- list()
+    outlier_log   <- data.frame()
+    ct_out_dir    <- file.path(out_dir, ct, "rna_evolutionary")
+    dir.create(ct_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+    for (contrast_name in names(evo_contrasts)) {
+      pos_sp <- evo_contrasts[[contrast_name]]$pos
+      neg_sp <- evo_contrasts[[contrast_name]]$neg
+      all_sp <- c(pos_sp, neg_sp)
+
+      ct_sp_idx  <- rownames(ct_meta)[ct_meta$species %in% all_sp]
+      if (length(ct_sp_idx) == 0) next
+
+      sub_counts <- ct_counts[, ct_sp_idx, drop = FALSE]
+      sub_meta   <- ct_meta[ct_sp_idx, , drop = FALSE]
+
+      # Per-contrast outlier removal
+      if (filter_outliers) {
+        flags <- detect_per_contrast_outliers(sub_counts, sub_meta,
+                                              sd_thresh = sd_thresh)
+        if (any(flags)) {
+          removed <- names(flags)[flags]
+          message("  [outlier] ", contrast_name, ": removing ", paste(removed, collapse=", "))
+          outlier_log <- append_outlier_log(outlier_log, ct, contrast_name, removed,
+                                            colSums(sub_counts)[removed])
+          keep_s      <- !flags
+          sub_counts  <- sub_counts[, keep_s, drop = FALSE]
+          sub_meta    <- sub_meta[keep_s, , drop = FALSE]
+        }
+      }
+
+      # Check min samples per group
+      pos_n <- sum(sub_meta$species %in% pos_sp)
+      neg_n <- sum(sub_meta$species %in% neg_sp)
+      if (pos_n < min_samples || neg_n < min_samples) next
+
+      # Filter low-count genes for this contrast
+      keep_g    <- rowSums(sub_counts >= 5) >= min_samples
+      sub_counts <- sub_counts[keep_g, , drop = FALSE]
+      if (nrow(sub_counts) < 100) next
+
+      sub_meta$species_group <- factor(
+        ifelse(sub_meta$species %in% pos_sp, "pos", "neg"),
+        levels = c("neg", "pos")
+      )
+
+      tryCatch({
+        dds <- DESeqDataSetFromMatrix(
+          countData = sub_counts,
+          colData   = sub_meta,
+          design    = ~ species_group
+        )
+        sizeFactors(dds) <- estimateSizeFactors(dds, type = "poscounts")$sizeFactor
+        dds <- DESeq(dds, fitType = "local", quiet = TRUE)
+        res <- results(dds, contrast = c("species_group", "pos", "neg"),
+                       independentFiltering = TRUE)
+        res$gene <- rownames(res)
+
+        # Save CSV
+        res_df <- as.data.frame(res)
+        res_df <- res_df[order(res_df$padj, na.last = TRUE), ]
+        write.csv(res_df, file.path(ct_out_dir, paste0(contrast_name, "_DE.csv")))
+
+        n_up   <- sum(!is.na(res$padj) & res$padj < 0.05 & res$log2FoldChange > 1, na.rm=TRUE)
+        n_down <- sum(!is.na(res$padj) & res$padj < 0.05 & res$log2FoldChange < -1, na.rm=TRUE)
+        message("  ", sprintf("%-40s", contrast_name), ": ",
+                n_up, " UP, ", n_down, " DOWN  (padj<0.05, |LFC|>1)")
+        results[[ct]][[contrast_name]] <- res
+
+      }, error = function(e) {
+        message("  [!] DESeq2 failed for ", ct, " / ", contrast_name, ": ", e$message)
+      })
+    }
+
+    # Save outlier log
+    if (nrow(outlier_log) > 0) {
+      save_outlier_summary(outlier_log, ct_out_dir, prefix = "RNA")
+    }
+  }
+
+  # Save full results list
+  saveRDS(results, file.path(out_dir, "_summary", "RNA_DE_res_list.rds"))
+  message("\nRNA evolutionary DE complete. Saved RNA_DE_res_list.rds")
+  return(invisible(results))
+}
+
+
+#' Run DESeq2 RNA DE for shared-peak-style all-vs-one contrasts (species_X vs rest)
+#'
+#' @param counts_rna  Genes × samples count matrix
+#' @param meta_rna    Sample metadata with species, cell_type
+#' @param species     Character vector of species
+#' @param out_dir     Output directory
+#' @return Nested list: cell_type → species → DESeqResults
+run_deseq2_rna_species <- function(counts_rna, meta_rna, species, out_dir,
+                                   min_samples = 2, filter_outliers = TRUE,
+                                   sd_thresh = 2.5) {
+  suppressPackageStartupMessages(library(DESeq2))
+
+  dir.create(file.path(out_dir, "_summary"), showWarnings = FALSE, recursive = TRUE)
+
+  meta_rna$species   <- factor(as.character(meta_rna$species), levels = species)
+  meta_rna$cell_type <- make.names(as.character(meta_rna$cell_type))
+  cell_types <- unique(meta_rna$cell_type)
+  results    <- list()
+
+  for (ct in cell_types) {
+    ct_idx    <- rownames(meta_rna)[meta_rna$cell_type == ct]
+    ct_counts <- counts_rna[, ct_idx, drop = FALSE]
+    ct_meta   <- meta_rna[ct_idx, , drop = FALSE]
+    message("\n=== [RNA species] ", ct, " (", ncol(ct_counts), " samples) ===")
+
+    keep_g    <- rowSums(ct_counts) > 0
+    ct_counts <- ct_counts[keep_g, , drop = FALSE]
+
+    results[[ct]] <- list()
+    ct_out        <- file.path(out_dir, ct, "rna_species")
+    dir.create(ct_out, showWarnings = FALSE, recursive = TRUE)
+
+    for (sp in species) {
+      if (sum(ct_meta$species == sp) < min_samples) next
+      if (sum(ct_meta$species != sp) < min_samples) next
+
+      sub_meta             <- ct_meta
+      sub_meta$is_focal    <- factor(ifelse(sub_meta$species == sp, sp, "Other"),
+                                     levels = c("Other", sp))
+
+      tryCatch({
+        dds <- DESeqDataSetFromMatrix(
+          countData = ct_counts,
+          colData   = sub_meta,
+          design    = ~ is_focal
+        )
+        sizeFactors(dds) <- estimateSizeFactors(dds, type = "poscounts")$sizeFactor
+        dds <- DESeq(dds, fitType = "local", quiet = TRUE)
+        res <- results(dds, contrast = c("is_focal", sp, "Other"),
+                       independentFiltering = TRUE)
+        res$gene <- rownames(res)
+
+        res_df <- as.data.frame(res)
+        res_df <- res_df[order(res_df$padj, na.last = TRUE), ]
+        write.csv(res_df, file.path(ct_out, paste0(sp, "_vs_rest_DE.csv")))
+
+        n_up <- sum(!is.na(res$padj) & res$padj < 0.05 & res$log2FoldChange > 1, na.rm=TRUE)
+        message("  ", sprintf("%-12s", sp), ": ", n_up, " UP (padj<0.05, LFC>1)")
+        results[[ct]][[sp]] <- res
+      }, error = function(e) {
+        message("  [!] ", sp, " failed: ", e$message)
+      })
+    }
+  }
+
+  saveRDS(results, file.path(out_dir, "_summary", "RNA_DE_species_res_list.rds"))
+  message("RNA species DE complete.")
+  return(invisible(results))
+}
+
+
+#' Ultra-robust filter for RNA DE genes
+#'
+#' Applies the same min(positive donors) > max(negative donors) criterion as
+#' ultra_robust_filter() for ATAC peaks, but on RNA pseudobulk log2CPM.
+#' A gene is "robust UP" if its lowest log2CPM across all positive-species donors
+#' exceeds the highest log2CPM across all negative-species donors.
+#' A gene is "robust DOWN" if its highest log2CPM across positive donors is below
+#' the lowest log2CPM across all negative donors.
+#'
+#' @param rna_res    Nested list: cell_type → contrast → DESeqResults
+#' @param counts_rna Genes × samples raw count matrix (all CTs combined)
+#' @param meta_rna   Sample metadata with cell_type and species columns
+#' @param contrasts  Named list from define_evolutionary_contrasts()
+#' @param out_dir    Root output directory (cell-type-first: {out_dir}/{CT}/rna_robust/)
+#' @param padj_thresh Adjusted p-value threshold (default 0.05)
+#' @param lfc_thresh  |log2FC| threshold (default 1)
+#' @param min_logcpm  Minimum log2CPM required in the positive group (default 0)
+#' @return Nested list: cell_type → contrast → list(up=genes, down=genes)
+ultra_robust_filter_rna <- function(rna_res, counts_rna, meta_rna, contrasts, out_dir,
+                                    padj_thresh = 0.05, lfc_thresh = 1, min_logcpm = 0) {
+  suppressPackageStartupMessages(library(matrixStats))
+
+  valid_samples <- intersect(rownames(meta_rna), colnames(counts_rna))
+  counts_rna    <- counts_rna[, valid_samples, drop = FALSE]
+
+  robust_genes <- list()
+
+  for (ct in names(rna_res)) {
+    message("\nRobust RNA DE filter: ", ct)
+    robust_genes[[ct]] <- list()
+
+    meta_ct    <- meta_rna[meta_rna$cell_type == ct, , drop = FALSE]
+    ct_samples <- intersect(rownames(meta_ct), colnames(counts_rna))
+    if (length(ct_samples) < 2) next
+    meta_ct   <- meta_ct[ct_samples, , drop = FALSE]
+    ct_counts <- counts_rna[, ct_samples, drop = FALSE]
+
+    lib_sizes  <- colSums(ct_counts)
+    cpm_mat    <- t(t(ct_counts) / lib_sizes) * 1e6
+    logcpm_mat <- log2(cpm_mat + 1)
+
+    for (contrast_name in names(rna_res[[ct]])) {
+      if (!contrast_name %in% names(contrasts)) next
+      res <- rna_res[[ct]][[contrast_name]]
+      if (is.null(res)) next
+
+      res_df  <- as.data.frame(res)
+      pos_sp  <- contrasts[[contrast_name]]$pos
+      neg_sp  <- contrasts[[contrast_name]]$neg
+
+      pos_samp <- ct_samples[meta_ct$species %in% pos_sp]
+      neg_samp <- ct_samples[meta_ct$species %in% neg_sp]
+      if (length(pos_samp) < 1 || length(neg_samp) < 1) next
+
+      # --- Robust UP ---
+      sig_up <- rownames(res_df)[!is.na(res_df$padj) &
+                                   res_df$padj < padj_thresh &
+                                   res_df$log2FoldChange > lfc_thresh]
+      sig_up <- intersect(sig_up, rownames(logcpm_mat))
+
+      up_robust <- character(0)
+      if (length(sig_up) > 0) {
+        min_pos  <- rowMins(as.matrix(logcpm_mat[sig_up, pos_samp, drop = FALSE]))
+        max_neg  <- rowMaxs(as.matrix(logcpm_mat[sig_up, neg_samp, drop = FALSE]))
+        keep     <- (min_pos > max_neg) & (min_pos > min_logcpm)
+        keep[is.na(keep)] <- FALSE
+        up_robust <- sig_up[keep]
+      }
+
+      # --- Robust DOWN ---
+      sig_dn <- rownames(res_df)[!is.na(res_df$padj) &
+                                   res_df$padj < padj_thresh &
+                                   res_df$log2FoldChange < -lfc_thresh]
+      sig_dn <- intersect(sig_dn, rownames(logcpm_mat))
+
+      dn_robust <- character(0)
+      if (length(sig_dn) > 0) {
+        max_pos  <- rowMaxs(as.matrix(logcpm_mat[sig_dn, pos_samp, drop = FALSE]))
+        min_neg  <- rowMins(as.matrix(logcpm_mat[sig_dn, neg_samp, drop = FALSE]))
+        keep     <- (max_pos < min_neg) & (min_neg > min_logcpm)
+        keep[is.na(keep)] <- FALSE
+        dn_robust <- sig_dn[keep]
+      }
+
+      message(sprintf("  [%s]  UP: %d sig -> %d robust  |  DOWN: %d sig -> %d robust",
+                      contrast_name,
+                      length(sig_up), length(up_robust),
+                      length(sig_dn), length(dn_robust)))
+
+      robust_genes[[ct]][[contrast_name]] <- list(up = up_robust, down = dn_robust)
+
+      n_robust <- length(up_robust) + length(dn_robust)
+      if (n_robust > 0) {
+        ct_dir <- file.path(out_dir, ct, "rna_robust")
+        dir.create(ct_dir, showWarnings = FALSE, recursive = TRUE)
+
+        parts <- list()
+        if (length(up_robust) > 0) {
+          df <- res_df[up_robust, , drop = FALSE]
+          df$gene <- rownames(df); df$direction <- "UP"
+          parts[[1]] <- df
+        }
+        if (length(dn_robust) > 0) {
+          df <- res_df[dn_robust, , drop = FALSE]
+          df$gene <- rownames(df); df$direction <- "DOWN"
+          parts[[2]] <- df
+        }
+        out_df <- do.call(rbind, parts)
+        out_df <- out_df[order(out_df$padj, na.last = TRUE), ]
+        write.csv(out_df,
+                  file.path(ct_dir, paste0(contrast_name, "_robust_DE.csv")),
+                  row.names = FALSE)
+      }
+    }
+  }
+
+  summary_dir <- file.path(out_dir, "_summary")
+  dir.create(summary_dir, showWarnings = FALSE, recursive = TRUE)
+  saveRDS(robust_genes, file.path(summary_dir, "RNA_DE_robust_list.rds"))
+  message("\nRobust RNA DE complete. Saved RNA_DE_robust_list.rds")
+  return(invisible(robust_genes))
 }
